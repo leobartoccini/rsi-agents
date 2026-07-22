@@ -3,6 +3,7 @@ defaults:
   - ippo_base
   - _self_
   - reward: common  # override on CLI: reward=individual
+  - influence: disabled  # override on CLI: influence=enabled_shared (social-influence intrinsic reward)
 
 # Environment-specific settings
 "ENV_NAME": "coin_game"
