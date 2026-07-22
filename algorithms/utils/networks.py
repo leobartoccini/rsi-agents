@@ -126,6 +126,117 @@ class ActorCritic(nn.Module):
         return pi, jnp.squeeze(critic, axis=-1)
 
 
+class ActorCriticMOA(nn.Module):
+    action_dim: int
+    num_agents: int
+    activation: str = "relu"
+
+    def setup(self):
+        self.cnn = CNN(self.activation)
+
+        self.policy_fc1 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.policy_fc2 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.actor_out = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))
+        self.critic_out = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
+
+        self.moa_fc1 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.moa_fc2 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.moa_out = nn.Dense(
+            self.num_agents * self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        )
+
+    def _activation_fn(self, x):
+        return nn.relu(x) if self.activation == "relu" else nn.tanh(x)
+
+    def __call__(self, obs):
+        embedding = self.cnn(obs)
+        h = self._activation_fn(self.policy_fc1(embedding))
+        h = self._activation_fn(self.policy_fc2(h))
+
+        pi = distrax.Categorical(logits=self.actor_out(h))
+        value = jnp.squeeze(self.critic_out(h), axis=-1)
+
+        return pi, value
+
+    def moa(self, obs, joint_action_onehot):
+        embedding = self.cnn(obs)
+        flat_actions = joint_action_onehot.reshape(*joint_action_onehot.shape[:-2], -1)
+        x = jnp.concatenate([embedding, flat_actions], axis=-1)
+        h = self._activation_fn(self.moa_fc1(x))
+        h = self._activation_fn(self.moa_fc2(h))
+        logits = self.moa_out(h)
+        return logits.reshape(*joint_action_onehot.shape[:-1], self.action_dim)
+
+    def init_all(self, obs, joint_action_onehot):
+        pi, value = self.__call__(obs)
+        moa_logits = self.moa(obs, joint_action_onehot)
+        return pi, value, moa_logits
+
+
+class ActorCriticMOARNN(nn.Module):
+    action_dim: int
+    num_agents: int
+    hidden_dim: int = 128
+    activation: str = "relu"
+
+    def setup(self):
+        self.cnn = CNN(self.activation)
+
+        self.policy_fc1 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.policy_fc2 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.policy_lstm = nn.LSTMCell(features=self.hidden_dim)
+        self.actor_out = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))
+        self.critic_out = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
+
+        self.moa_fc1 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.moa_fc2 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.moa_lstm = nn.LSTMCell(features=self.hidden_dim)
+        self.moa_out = nn.Dense(
+            self.num_agents * self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        )
+
+    def _activation_fn(self, x):
+        return nn.relu(x) if self.activation == "relu" else nn.tanh(x)
+
+    def __call__(self, policy_carry, obs):
+        embedding = self.cnn(obs)
+        h = self._activation_fn(self.policy_fc1(embedding))
+        h = self._activation_fn(self.policy_fc2(h))
+        new_policy_carry, ph = self.policy_lstm(policy_carry, h)
+
+        pi = distrax.Categorical(logits=self.actor_out(ph))
+        value = jnp.squeeze(self.critic_out(ph), axis=-1)
+
+        return new_policy_carry, (pi, value)
+
+    def moa_features(self, obs):
+        embedding = self.cnn(obs)
+        h = self._activation_fn(self.moa_fc1(embedding))
+        h = self._activation_fn(self.moa_fc2(h))
+        return h
+
+    def moa_step(self, moa_carry, moa_features, joint_action_onehot):
+        flat_actions = joint_action_onehot.reshape(*joint_action_onehot.shape[:-2], -1)
+        x = jnp.concatenate([moa_features, flat_actions], axis=-1)
+        new_moa_carry, mh = self.moa_lstm(moa_carry, x)
+        logits = self.moa_out(mh)
+        return new_moa_carry, logits.reshape(*joint_action_onehot.shape[:-1], self.action_dim)
+
+    def moa(self, moa_carry, obs, joint_action_onehot):
+        feats = self.moa_features(obs)
+        return self.moa_step(moa_carry, feats, joint_action_onehot)
+
+    def init_all(self, policy_carry, moa_carry, obs, joint_action_onehot):
+        pc, (pi, value) = self.__call__(policy_carry, obs)
+        mc, logits = self.moa(moa_carry, obs, joint_action_onehot)
+        return (pi, value, logits)
+
+    @staticmethod
+    def initialize_carry(batch_size, hidden_dim):
+        z = jnp.zeros((batch_size, hidden_dim))
+        return (z, z)
+
+
 class Actor(nn.Module):
     """
     Standalone Actor network for MAPPO algorithm.
