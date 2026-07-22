@@ -1,0 +1,17 @@
+# @package _global_
+# Social-influence intrinsic reward (Jaques et al., 2019), MOA variant. Requires
+# independent per-agent policies -- distinguishable agents are what make "modeling
+# another agent" a meaningful counterfactual question at all.
+PARAMETER_SHARING: False
+INFLUENCE_REWARD: True
+INFLUENCE_WEIGHT: 0.62   # beta; paper's Table 3 Cleanup-MOA value, starting point for tuning
+MOA_LOSS_WEIGHT: 15.0     # paper's Table 3 Cleanup-MOA value, starting point for tuning
+# Influence needs distinguishable per-agent rewards -- the shared/common-reward path
+# (the file-level default) never reaches the branch that produces them. Set this
+# directly here rather than changing the file's default `reward` group, so non-influence
+# runs of this env are unaffected.
+ENV_KWARGS:
+  shared_rewards: False
+REWARD: individual
+WANDB_TAGS:
+  - INFLUENCE_MOA

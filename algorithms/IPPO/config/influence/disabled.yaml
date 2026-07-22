@@ -1,0 +1,3 @@
+# @package _global_
+# Default: no social-influence intrinsic reward (plain IPPO baseline).
+INFLUENCE_REWARD: False

@@ -1,0 +1,20 @@
+# @package _global_
+# Social-influence intrinsic reward (Jaques et al., 2019), shared-policy variant --
+# no MOA network at all (see influence/enabled.yaml for the cleanup MOA version this
+# replaces). With PARAMETER_SHARING, one policy decides every agent's action, so that
+# same network already IS the exact model of every other agent: the counterfactual
+# "what would agent j do differently" is answered by replaying env.step with a
+# hypothetical action for the acting agent (same RNG, same pre-step state) and asking
+# the shared policy about the resulting real observation -- no approximation, no
+# auxiliary loss, no extra params.
+PARAMETER_SHARING: True
+INFLUENCE_REWARD: True
+INFLUENCE_WEIGHT: 0.224   # paper's Table 3 Cleanup-MOA value, starting point for tuning
+# Influence needs distinguishable per-agent rewards -- the shared/common-reward path
+# never reaches the branch that produces them. Set this directly here rather than
+# changing the file's default `reward` group, so non-influence runs are unaffected.
+ENV_KWARGS:
+  shared_rewards: False
+REWARD: individual
+WANDB_TAGS:
+  - INFLUENCE_SHARED_POLICY

@@ -1,0 +1,21 @@
+# @package _global_
+# Social-influence intrinsic reward (Jaques et al., 2019), independent-policy variant --
+# no MOA network, no shared policy either (see influence/enabled_shared.yaml for that
+# version). Agents keep separate policies (PARAMETER_SHARING=False), but the reward
+# computation is given direct read access to every other agent's params during
+# centralized training -- that's fine because it's only ever used to shape the
+# training reward, never to choose an action, so decentralized execution still holds.
+# The counterfactual "what would agent j do differently" is answered by replaying
+# env.step with a hypothetical action for the acting agent (same RNG, same pre-step
+# state) and asking agent j's own real network about the resulting real observation.
+PARAMETER_SHARING: False
+INFLUENCE_REWARD: True
+INFLUENCE_WEIGHT: 0.224   # paper's Table 3 Cleanup-MOA value, starting point for tuning
+# Influence needs distinguishable per-agent rewards -- the shared/common-reward path
+# never reaches the branch that produces them. Set this directly here rather than
+# changing the file's default `reward` group, so non-influence runs are unaffected.
+ENV_KWARGS:
+  shared_rewards: False
+REWARD: individual
+WANDB_TAGS:
+  - INFLUENCE_INDEPENDENT_POLICY

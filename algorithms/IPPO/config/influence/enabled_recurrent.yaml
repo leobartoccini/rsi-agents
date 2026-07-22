@@ -1,0 +1,23 @@
+# @package _global_
+# Social-influence intrinsic reward (Jaques et al., 2019), recurrent MOA variant --
+# see influence/enabled.yaml for the feedforward version this extends. Adds an LSTM to
+# both the acting policy and the MOA head so the counterfactual reasoning behind the
+# influence reward can condition on temporal context, not just the current single frame.
+PARAMETER_SHARING: False
+INFLUENCE_REWARD: True
+RECURRENT_MOA: True
+LSTM_HIDDEN_DIM: 128
+# NUM_MINIBATCHES must divide NUM_ENVS here (minibatching permutes the actor axis only,
+# keeping each minibatch's full time sequence intact for BPTT) -- NOT NUM_STEPS*NUM_ENVS
+# like the feedforward path. The base default of 500 is invalid once NUM_ENVS is small.
+NUM_MINIBATCHES: 8
+# Full backprop-through-time over NUM_STEPS sequential CNN+LSTM steps is memory-heavy;
+# start shorter than the feedforward path's default of 1000 and raise if it fits.
+NUM_STEPS: 256
+INFLUENCE_WEIGHT: 0.62
+MOA_LOSS_WEIGHT: 15.0
+ENV_KWARGS:
+  shared_rewards: False
+REWARD: individual
+WANDB_TAGS:
+  - INFLUENCE_MOA_RNN
