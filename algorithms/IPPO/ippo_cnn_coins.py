@@ -1,4 +1,4 @@
-"""
+""" 
 Based on PureJaxRL & jaxmarl Implementation of PPO
 """
 import jax
@@ -18,7 +18,6 @@ import copy
 # Import shared network architectures
 from algorithms.utils import (
     ActorCritic,
-    ActorCriticMOARNN,
     batchify,
     batchify_dict,
     unbatchify,
@@ -26,38 +25,23 @@ from algorithms.utils import (
     load_params,
     evaluate_ippo as evaluate,
     Transition,
-    MOATransition,
 )
-
-
-def reset_hstate(carry, done_env):
-    """Zero an LSTM carry wherever done_env is True. done_env: (B,), broadcasts against
-    carry=(c,h) each (B, hidden_dim). Episodes in this env reset synchronously for every
-    agent, so a single per-environment boolean is the correct reset signal (see
-    LogWrapper's docstring)."""
-    c, h = carry
-    mask = done_env[:, None]
-    return (jnp.where(mask, 0.0, c), jnp.where(mask, 0.0, h))
-
 
 def make_train(config):
     env = socialjax.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    # Three ways to get a social-influence reward here, picked by config flags:
-    #  - PARAMETER_SHARING=True + INFLUENCE_REWARD=True (influence/enabled_shared.yaml):
-    #    no MOA network -- the one shared policy already IS the exact model of every
-    #    other agent.
-    #  - PARAMETER_SHARING=False + INFLUENCE_REWARD=True (influence/enabled_independent.yaml):
-    #    no MOA network either -- each agent's reward computation is given direct read
-    #    access to every other agent's own params during centralized training.
-    #  - PARAMETER_SHARING=False + INFLUENCE_REWARD=True + RECURRENT_MOA=True
-    #    (influence/enabled_recurrent.yaml): the actual Jaques et al. MOA -- a recurrent
-    #    auxiliary head trained to predict other agents' next actions from the ego
-    #    agent's own observation, exactly like ippo_cnn_cleanup.py.
-    if config.get("RECURRENT_MOA", False):
-        assert config.get("INFLUENCE_REWARD", False) and not config["PARAMETER_SHARING"], (
-            "RECURRENT_MOA requires INFLUENCE_REWARD=True and PARAMETER_SHARING=False "
-            "(see influence/enabled_recurrent.yaml)."
-        )
+    # No auxiliary "model of other agents" network for the influence reward, in either
+    # PARAMETER_SHARING mode:
+    #  - PARAMETER_SHARING=True (influence/enabled_shared.yaml): one policy shared
+    #    across agents already IS the exact model of every other agent (identical
+    #    params decide every agent's action).
+    #  - PARAMETER_SHARING=False (influence/enabled_independent.yaml): agents keep
+    #    separate policies, but each agent's reward computation is given direct read
+    #    access to every other agent's params during centralized training (never at
+    #    execution time) -- decentralized execution isn't broken since the reward is
+    #    only ever used for the training update, not for acting.
+    # Either way the counterfactual query is answered by literally replaying env.step
+    # with a hypothetical action for the acting agent and asking the (shared or
+    # independent) policy about the resulting real observation.
     if config["PARAMETER_SHARING"]:
         config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     else:
@@ -96,31 +80,17 @@ def make_train(config):
 
         # INIT NETWORK
         influence_reward = config.get("INFLUENCE_REWARD", False)
-        recurrent_moa = config.get("RECURRENT_MOA", False)
-        hidden_dim = config.get("LSTM_HIDDEN_DIM", 128)
         action_dim = env.action_space().n
         if config["PARAMETER_SHARING"]:
-            network = ActorCritic(action_dim, activation=config["ACTIVATION"])
-        elif recurrent_moa:
-            network = [ActorCriticMOARNN(
-                action_dim, num_agents=env.num_agents, hidden_dim=hidden_dim, activation=config["ACTIVATION"]
-            ) for _ in range(env.num_agents)]
+            network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
         else:
-            network = [ActorCritic(action_dim, activation=config["ACTIVATION"]) for _ in range(env.num_agents)]
-
+            network = [ActorCritic(env.action_space().n, activation=config["ACTIVATION"]) for _ in range(env.num_agents)]
+        
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros((1, *(env.observation_space()[0]).shape))
-        init_joint_action = jnp.zeros((1, env.num_agents, action_dim))
 
         if config["PARAMETER_SHARING"]:
             network_params = network.init(_rng, init_x)
-        elif recurrent_moa:
-            init_ph_1 = ActorCriticMOARNN.initialize_carry(1, hidden_dim)
-            init_mh_1 = ActorCriticMOARNN.initialize_carry(1, hidden_dim)
-            network_params = [
-                network[i].init(_rng, init_ph_1, init_mh_1, init_x, init_joint_action, method=network[i].init_all)
-                for i in range(env.num_agents)
-            ]
         else:
             network_params = [network[i].init(_rng, init_x) for i in range(env.num_agents)]
         if config["ANNEAL_LR"]:
@@ -151,28 +121,18 @@ def make_train(config):
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
 
-        if recurrent_moa:
-            policy_hstate = [ActorCriticMOARNN.initialize_carry(config["NUM_ENVS"], hidden_dim) for _ in range(env.num_agents)]
-            moa_hstate = [ActorCriticMOARNN.initialize_carry(config["NUM_ENVS"], hidden_dim) for _ in range(env.num_agents)]
-
         # TRAIN LOOP
         def _update_step(runner_state, unused):
-            if recurrent_moa:
-                # Snapshot the carries entering this rollout window -- they were already
-                # correctly reset in real time during the previous window's collection, so
-                # the loss's time-scan can use them as-is with no reset check at step 0.
-                _, _, _, init_policy_hstate, init_moa_hstate, _, _ = runner_state
-
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                if recurrent_moa:
-                    train_state, env_state, last_obs, policy_hstate, moa_hstate, update_step, rng = runner_state
-                else:
-                    train_state, env_state, last_obs, update_step, rng = runner_state
+                train_state, env_state, last_obs, update_step, rng = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
 
+                
+                # obs_batch = jnp.stack([last_obs[a] for a in env.agents]).reshape(-1, *env.observation_space().shape)
+                
                 if config["PARAMETER_SHARING"]:
                     obs_batch = jnp.transpose(last_obs,(1,0,2,3,4)).reshape(-1, *(env.observation_space()[0]).shape)
                     pi, value = network.apply(train_state.params, obs_batch)
@@ -181,22 +141,6 @@ def make_train(config):
                     env_act = unbatchify(
                         action, env.agents, config["NUM_ENVS"], env.num_agents
                     )
-                elif recurrent_moa:
-                    obs_batch = jnp.transpose(last_obs,(1,0,2,3,4))
-                    env_act = {}
-                    log_prob = []
-                    value = []
-                    pi_list = []
-                    new_policy_hstate = []
-                    for i in range(env.num_agents):
-                        rng, agent_rng = jax.random.split(rng)
-                        new_ph_i, (pi, value_i) = network[i].apply(train_state[i].params, policy_hstate[i], obs_batch[i])
-                        action = pi.sample(seed=agent_rng)
-                        log_prob.append(pi.log_prob(action))
-                        env_act[env.agents[i]] = action
-                        value.append(value_i)
-                        pi_list.append(pi)
-                        new_policy_hstate.append(new_ph_i)
                 else:
                     obs_batch = jnp.transpose(last_obs,(1,0,2,3,4))
                     env_act = {}
@@ -213,106 +157,31 @@ def make_train(config):
 
                 # env_act = {k: v.flatten() for k, v in env_act.items()}
                 env_act = [v for v in env_act.values()]
-
-                # SOCIAL INFLUENCE REWARD -- recurrent MOA variant. Fully computable from
-                # info already available at time t (own obs, real joint action, own
-                # policy) -- doesn't need to wait for env.step's output, unlike the
-                # MOA-free variants below which need the real/counterfactual next obs.
-                if recurrent_moa:
-                    joint_action = jnp.stack(env_act, axis=-1)  # (NUM_ENVS, num_agents)
-                    joint_action_onehot = jax.nn.one_hot(joint_action, action_dim)
-
-                    current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                    beta = config["INFLUENCE_WEIGHT"] * rew_shaping_anneal(current_timestep)
-
-                    influence = []
-                    new_moa_hstate = []
-                    for k in range(env.num_agents):
-                        params_k = train_state[k].params
-
-                        # The action feeds into the MOA LSTM itself (paper Fig. 6), so a
-                        # counterfactual action changes the LSTM's output, not just a
-                        # downstream head -- every candidate action needs its own
-                        # moa_step call. moa_features (CNN+FC+FC) is action-independent
-                        # though, so it's computed once and reused for the real query and
-                        # all counterfactuals below, rather than rerunning the CNN.
-                        moa_feats_k = network[k].apply(
-                            params_k, obs_batch[k], method=network[k].moa_features
-                        )
-                        new_mh_k, cond_logits = network[k].apply(
-                            params_k, moa_hstate[k], moa_feats_k, joint_action_onehot,
-                            method=network[k].moa_step,
-                        )
-                        new_moa_hstate.append(new_mh_k)
-
-                        def _counterfactual_logits(a_idx, k=k, params_k=params_k, moa_feats_k=moa_feats_k):
-                            cf_onehot = jax.nn.one_hot(a_idx, action_dim)
-                            cf_joint = joint_action_onehot.at[:, k, :].set(cf_onehot)
-                            # Uses the incoming (pre-this-step) moa_hstate[k], same as the
-                            # real query -- "what if k had acted differently right now,
-                            # holding everything remembered before now fixed." The
-                            # counterfactual carry is discarded, never stored.
-                            _, cf_logits = network[k].apply(
-                                params_k, moa_hstate[k], moa_feats_k, cf_joint,
-                                method=network[k].moa_step,
-                            )
-                            return cf_logits
-
-                        cond_probs = jax.nn.softmax(cond_logits, axis=-1)
-                        cf_logits = jax.vmap(_counterfactual_logits)(jnp.arange(action_dim))
-                        cf_probs = jax.nn.softmax(cf_logits, axis=-1)
-
-                        # Marginalize the counterfactuals over agent k's own real policy.
-                        marginal_probs = jnp.einsum(
-                            "ea,aejt->ejt", pi_list[k].probs, cf_probs
-                        )
-
-                        kl_per_j = distrax.Categorical(probs=cond_probs).kl_divergence(
-                            distrax.Categorical(probs=marginal_probs)
-                        )  # (NUM_ENVS, num_agents)
-
-                        not_self = jnp.array([j != k for j in range(env.num_agents)])
-                        influence.append(jnp.sum(jnp.where(not_self, kl_per_j, 0.0), axis=-1))
-
-                    influence = jnp.stack(influence, axis=-1)  # (NUM_ENVS, num_agents)
-
+                
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                env_state_t = env_state  # pre-step state, needed below for the MOA-free counterfactuals
+                env_state_t = env_state  # pre-step state, needed below for counterfactuals
 
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state_t, env_act)
 
-                if recurrent_moa:
-                    done_env = done["__all__"]
-                    # Don't reward "influence" on the step the episode ends -- the
-                    # relationship/context between agents is about to reset, so a KL
-                    # divergence computed right at that boundary isn't meaningful. Rare
-                    # here (NUM_STEPS << num_inner_steps, so most windows never see a
-                    # done step at all) but cheap and more correct.
-                    reward = reward + beta * influence * (1.0 - done_env.astype(jnp.float32))[:, None]
-                    # Auto-reset semantics: the obs env.step returns when done is True is
-                    # already the fresh post-reset observation, so the carry entering the
-                    # *next* step must be zeroed now, using *this* step's done.
-                    policy_hstate_next = [reset_hstate(h, done_env) for h in new_policy_hstate]
-                    moa_hstate_next = [reset_hstate(h, done_env) for h in new_moa_hstate]
-                elif influence_reward:
-                    # SOCIAL INFLUENCE REWARD, MOA-free. No auxiliary network: "what
-                    # would agent j do differently" is answered by literally re-running
-                    # env.step with the SAME rng_step and SAME pre-step env_state_t,
-                    # swapping only agent k's action, and asking a real policy about the
-                    # resulting real (not approximated) observation. Two variants
-                    # depending on architecture:
-                    #  - PARAMETER_SHARING=True: one network answers for every agent.
-                    #  - PARAMETER_SHARING=False: each agent keeps its own network, but
-                    #    the reward computation is given direct read access to every
-                    #    other agent's params (fine for a training-time-only quantity --
-                    #    it never touches how actions get chosen, so decentralized
-                    #    execution still holds).
+                # SOCIAL INFLUENCE REWARD, MOA-free. No auxiliary network: "what would
+                # agent j do differently" is answered by literally re-running env.step
+                # with the SAME rng_step and SAME pre-step env_state_t, swapping only
+                # agent k's action, and asking a real policy about the resulting real
+                # (not approximated) observation. Cheap here since num_agents and
+                # action_dim are both small. Two variants depending on architecture:
+                #  - PARAMETER_SHARING=True: one network answers for every agent.
+                #  - PARAMETER_SHARING=False: each agent keeps its own network, but the
+                #    reward computation is given direct read access to every other
+                #    agent's params (fine for a training-time-only quantity -- it never
+                #    touches how actions get chosen, so decentralized execution still
+                #    holds).
+                if influence_reward:
                     obs_shape = (env.observation_space()[0]).shape
-                    not_self_mat = jnp.array(
+                    not_self = jnp.array(
                         [[j != k for j in range(env.num_agents)] for k in range(env.num_agents)]
                     )  # (k, j)
 
@@ -368,7 +237,7 @@ def make_train(config):
                             kl_per_j = _safe_kl(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
 
                             influence.append(
-                                jnp.sum(jnp.where(not_self_mat[k][:, None], kl_per_j, 0.0), axis=0)
+                                jnp.sum(jnp.where(not_self[k][:, None], kl_per_j, 0.0), axis=0)
                             )
                     else:
                         # Same idea, but each agent j's conditional/counterfactual query
@@ -412,7 +281,7 @@ def make_train(config):
                             kl_per_j = _safe_kl(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
 
                             influence.append(
-                                jnp.sum(jnp.where(not_self_mat[k][:, None], kl_per_j, 0.0), axis=0)
+                                jnp.sum(jnp.where(not_self[k][:, None], kl_per_j, 0.0), axis=0)
                             )
 
                     influence = jnp.stack(influence, axis=0)  # (num_agents, NUM_ENVS)
@@ -430,7 +299,7 @@ def make_train(config):
 
                 if config["PARAMETER_SHARING"]:
                     info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
-                    if influence_reward and not recurrent_moa:
+                    if influence_reward:
                         info["influence_reward"] = influence.T.reshape(-1)
                     transition = Transition(
                         batchify_dict(done, env.agents, config["NUM_ACTORS"]).squeeze(),
@@ -441,24 +310,6 @@ def make_train(config):
                         obs_batch,
                         info,
                         )
-                elif recurrent_moa:
-                    transition = []
-                    done = [v for v in done.values()]
-                    for i in range(env.num_agents):
-                        info_i = {key: jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"]),1), value[:,i]) for key, value in info.items()}
-                        info_i["influence_reward"] = influence[:, i].reshape((config["NUM_ACTORS"], 1))
-                        transition.append(MOATransition(
-                            done[i],
-                            env_act[i],
-                            value[i],
-                            reward[:,i],
-                            log_prob[i],
-                            obs_batch[i],
-                            info_i,
-                            joint_action,
-                            joint_action,  # placeholder, replaced with the real next-step
-                                           # joint action once the scan below completes
-                        ))
                 else:
                     transition = []
                     done = [v for v in done.values()]
@@ -475,43 +326,18 @@ def make_train(config):
                             obs_batch[i],
                             info_i,
                         ))
-                if recurrent_moa:
-                    runner_state = (train_state, env_state, obsv, policy_hstate_next, moa_hstate_next, update_step, rng)
-                else:
-                    runner_state = (train_state, env_state, obsv, update_step, rng)
+                runner_state = (train_state, env_state, obsv, update_step, rng)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
-            if recurrent_moa:
-                # traj_batch[i].joint_action has shape (NUM_STEPS, NUM_ENVS, num_agents).
-                # Build the MOA's next-action cross-entropy target here, while the time
-                # axis is still intact -- PPO minibatching below shuffles it away. Pad
-                # with the last step's action rather than jnp.roll, to avoid wrapping the
-                # first timestep's action into the last slot.
-                joint_action_t = traj_batch[0].joint_action
-                next_joint_action = jnp.concatenate(
-                    [joint_action_t[1:], joint_action_t[-1:]], axis=0
-                )
-                traj_batch = [t._replace(next_joint_action=next_joint_action) for t in traj_batch]
-
             # CALCULATE ADVANTAGE
-            if recurrent_moa:
-                train_state, env_state, last_obs, policy_hstate, moa_hstate, update_step, rng = runner_state
-            else:
-                train_state, env_state, last_obs, update_step, rng = runner_state
+            train_state, env_state, last_obs, update_step, rng = runner_state
             if config["PARAMETER_SHARING"]:
                 last_obs_batch = jnp.transpose(last_obs,(1,0,2,3,4)).reshape(-1, *(env.observation_space()[0]).shape)
                 _, last_val = network.apply(train_state.params, last_obs_batch)
-            elif recurrent_moa:
-                last_obs_batch = jnp.transpose(last_obs,(1,0,2,3,4))
-                last_val = []
-                for i in range(env.num_agents):
-                    _, (_, last_val_i) = network[i].apply(train_state[i].params, policy_hstate[i], last_obs_batch[i])
-                    last_val.append(last_val_i)
-                last_val = jnp.stack(last_val, axis=0)
             else:
                 last_obs_batch = jnp.transpose(last_obs,(1,0,2,3,4))
                 last_val = []
@@ -537,7 +363,7 @@ def make_train(config):
                         + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
                     )
                     return (gae, value), gae
-
+                
                 _, advantages = jax.lax.scan(
                     _get_advantages,
                     (jnp.zeros_like(last_val), last_val),
@@ -560,35 +386,12 @@ def make_train(config):
             # UPDATE NETWORK
             def _update_epoch(update_state, unused, i):
                 def _update_minbatch(train_state, batch_info, network_used):
-                    if recurrent_moa:
-                        traj_batch, advantages, targets, ph, mh = batch_info
-                    else:
-                        traj_batch, advantages, targets = batch_info
+                    traj_batch, advantages, targets = batch_info
 
-                    def _loss_fn(params, traj_batch, gae, targets, network_used, ph=None, mh=None):
+                    def _loss_fn(params, traj_batch, gae, targets, network_used):
                         # RERUN NETWORK
-                        if recurrent_moa:
-                            dones = traj_batch.done
-                            # reset entering step t = done[t-1]; step 0 uses ph/mh as-is
-                            # (already correctly live-reset when captured before the rollout).
-                            reset_in = jnp.concatenate(
-                                [jnp.zeros_like(dones[:1]), dones[:-1]], axis=0
-                            ).astype(bool)
-
-                            def _policy_body(carry, xs):
-                                obs_t, reset_t = xs
-                                carry = reset_hstate(carry, reset_t)
-                                new_carry, (pi_t, value_t) = network_used.apply(params, carry, obs_t)
-                                return new_carry, (pi_t.logits, value_t)
-
-                            _, (logits, value) = jax.lax.scan(
-                                _policy_body, ph, (traj_batch.obs, reset_in)
-                            )
-                            pi = distrax.Categorical(logits=logits)
-                            log_prob = pi.log_prob(traj_batch.action)
-                        else:
-                            pi, value = network_used.apply(params, traj_batch.obs)
-                            log_prob = pi.log_prob(traj_batch.action)
+                        pi, value = network_used.apply(params, traj_batch.obs)
+                        log_prob = pi.log_prob(traj_batch.action)
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
@@ -620,157 +423,54 @@ def make_train(config):
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
                         )
-
-                        if recurrent_moa:
-                            # MOA auxiliary loss: rerun the MOA head with fresh params
-                            # (same rerun-from-stored-obs pattern as the actor/critic
-                            # above) and predict the real next-step joint action. The
-                            # action feeds into the MOA LSTM itself (paper Fig. 6), so
-                            # the scan body needs it at every step -- can't defer to a
-                            # single vectorized head call after the scan. moa_features
-                            # (CNN+FC+FC) is still action-independent though: compute it
-                            # for every timestep in one big vectorized call before the
-                            # scan, so only the truly-sequential LSTM step runs inside it.
-                            T, Am = traj_batch.obs.shape[0], traj_batch.obs.shape[1]
-                            flat_obs = traj_batch.obs.reshape(T * Am, *traj_batch.obs.shape[2:])
-                            flat_feats = network_used.apply(params, flat_obs, method=network_used.moa_features)
-                            moa_feats = flat_feats.reshape(T, Am, *flat_feats.shape[1:])
-
-                            def _moa_body(carry, xs):
-                                feats_t, action_t, reset_t = xs
-                                carry = reset_hstate(carry, reset_t)
-                                new_carry, logits_t = network_used.apply(
-                                    params, carry, feats_t, jax.nn.one_hot(action_t, action_dim),
-                                    method=network_used.moa_step,
-                                )
-                                return new_carry, logits_t
-
-                            _, moa_logits = jax.lax.scan(
-                                _moa_body, mh, (moa_feats, traj_batch.joint_action, reset_in)
-                            )
-                            moa_ce = optax.softmax_cross_entropy_with_integer_labels(
-                                moa_logits, traj_batch.next_joint_action
-                            )  # (T, Am, num_agents)
-                            not_self = jnp.array([j != i for j in range(env.num_agents)])
-                            per_sample_moa_loss = jnp.sum(jnp.where(not_self, moa_ce, 0.0), axis=-1)
-                            moa_correct = (
-                                jnp.argmax(moa_logits, axis=-1) == traj_batch.next_joint_action
-                            ).astype(jnp.float32)
-                            per_sample_moa_acc = jnp.sum(
-                                jnp.where(not_self, moa_correct, 0.0), axis=-1
-                            ) / jnp.sum(not_self)
-
-                            # The last timestep of each collected window has no real
-                            # "next action" -- next_joint_action repeats the last real
-                            # action as a filler there, which would otherwise be a
-                            # spurious training target. Exclude it explicitly with a
-                            # positional mask rather than `done`: NUM_STEPS is far
-                            # shorter than num_inner_steps here, so episodes almost
-                            # never actually end inside a window and a done-based mask
-                            # would essentially never fire. Minibatching for this path
-                            # keeps the time axis intact and unshuffled (see the
-                            # actor-axis-only permutation above), so index -1 reliably
-                            # is that one artificial sample for every actor.
-                            valid_target = jnp.ones((per_sample_moa_loss.shape[0],)).at[-1].set(0.0)
-                            denom = valid_target.sum() * per_sample_moa_loss.shape[1]
-                            moa_loss = (per_sample_moa_loss * valid_target[:, None]).sum() / denom
-                            moa_accuracy = (per_sample_moa_acc * valid_target[:, None]).sum() / denom
-
-                            # Curriculum-gate the auxiliary loss the same way the reward
-                            # is gated. Without this, the MOA loss reshapes the shared
-                            # CNN trunk toward "predict teammates' actions" from update 0,
-                            # well before the influence reward itself has ramped in,
-                            # distorting early policy learning before it gets off the ground.
-                            current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                            moa_weight = config["MOA_LOSS_WEIGHT"] * rew_shaping_anneal(current_timestep)
-                            total_loss = total_loss + moa_weight * moa_loss
-                            return total_loss, (value_loss, loss_actor, entropy, moa_loss, moa_accuracy)
-
                         return total_loss, (value_loss, loss_actor, entropy)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    if recurrent_moa:
-                        total_loss, grads = grad_fn(
-                                train_state.params, traj_batch, advantages, targets, network_used, ph, mh
-                            )
-                    else:
-                        total_loss, grads = grad_fn(
-                                train_state.params, traj_batch, advantages, targets, network_used
-                            )
+                    total_loss, grads = grad_fn(
+                            train_state.params, traj_batch, advantages, targets, network_used
+                        )
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
 
-                if recurrent_moa:
-                    train_state, traj_batch, advantages, targets, init_ph, init_mh, rng = update_state
-                else:
-                    train_state, traj_batch, advantages, targets, rng = update_state
+                train_state, traj_batch, advantages, targets, rng = update_state
                 rng, _rng = jax.random.split(rng)
-
-                if recurrent_moa:
-                    # Minibatch by permuting the ACTOR axis only, keeping the full time
-                    # axis intact per minibatch -- required once temporal order matters.
-                    # NUM_MINIBATCHES must divide NUM_ACTORS here (not NUM_STEPS*NUM_ACTORS).
-                    A = config["NUM_ACTORS"]
-                    M = config["NUM_MINIBATCHES"]
-                    Am = A // M
-                    perm = jax.random.permutation(_rng, A)
-                    sh_traj = jax.tree_util.tree_map(lambda x: jnp.take(x, perm, axis=1), traj_batch)
-                    sh_adv = jnp.take(advantages, perm, axis=1)
-                    sh_tgt = jnp.take(targets, perm, axis=1)
-                    sh_ph = jax.tree_util.tree_map(lambda x: jnp.take(x, perm, axis=0), init_ph)
-                    sh_mh = jax.tree_util.tree_map(lambda x: jnp.take(x, perm, axis=0), init_mh)
-
-                    def split_traj(x):  # (T,A,...) -> (M,T,Am,...)
-                        x = x.reshape(x.shape[0], M, Am, *x.shape[2:])
-                        return jnp.swapaxes(x, 0, 1)
-
-                    def split_carry(x):  # (A,hidden) -> (M,Am,hidden)
-                        return x.reshape(M, Am, *x.shape[1:])
-
-                    mb_traj = jax.tree_util.tree_map(split_traj, sh_traj)
-                    mb_adv = split_traj(sh_adv)
-                    mb_tgt = split_traj(sh_tgt)
-                    mb_ph = jax.tree_util.tree_map(split_carry, sh_ph)
-                    mb_mh = jax.tree_util.tree_map(split_carry, sh_mh)
-
-                    minibatches = (mb_traj, mb_adv, mb_tgt, mb_ph, mb_mh)
+                batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
+                assert (
+                    batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
+                ), "batch size must be equal to number of steps * number of actors"
+                permutation = jax.random.permutation(_rng, batch_size)
+                batch = (traj_batch, advantages, targets)
+                batch = jax.tree_util.tree_map(
+                        lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+                    )
+                # if config["PARAMETER_SHARING"]:
+                    
+                # else:
+                #     batch = jax.tree_util.tree_map(
+                #         lambda x: x.reshape((batch_size,) + x.shape[2:]),  # 保持第一个维度为batch_size，自动计算第二个维度
+                #         batch
+                #     )
+                shuffled_batch = jax.tree_util.tree_map(
+                    lambda x: jnp.take(x, permutation, axis=0), batch
+                )
+                minibatches = jax.tree_util.tree_map(
+                    lambda x: jnp.reshape(
+                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
+                    ),
+                    shuffled_batch,
+                )
+                if config["PARAMETER_SHARING"]:
+                    train_state, total_loss = jax.lax.scan(
+                        lambda state, batch_info: _update_minbatch(state, batch_info, network), train_state, minibatches
+                    )
+                else:
                     train_state, total_loss = jax.lax.scan(
                         lambda state, batch_info: _update_minbatch(state, batch_info, network[i]), train_state, minibatches
                     )
-                else:
-                    batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
-                    assert (
-                        batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
-                    ), "batch size must be equal to number of steps * number of actors"
-                    permutation = jax.random.permutation(_rng, batch_size)
-                    batch = (traj_batch, advantages, targets)
-                    batch = jax.tree_util.tree_map(
-                            lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
-                        )
-                    shuffled_batch = jax.tree_util.tree_map(
-                        lambda x: jnp.take(x, permutation, axis=0), batch
-                    )
-                    minibatches = jax.tree_util.tree_map(
-                        lambda x: jnp.reshape(
-                            x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
-                        ),
-                        shuffled_batch,
-                    )
-                    if config["PARAMETER_SHARING"]:
-                        train_state, total_loss = jax.lax.scan(
-                            lambda state, batch_info: _update_minbatch(state, batch_info, network), train_state, minibatches
-                        )
-                    else:
-                        train_state, total_loss = jax.lax.scan(
-                            lambda state, batch_info: _update_minbatch(state, batch_info, network[i]), train_state, minibatches
-                        )
 
-                if recurrent_moa:
-                    update_state = (train_state, traj_batch, advantages, targets, init_ph, init_mh, rng)
-                else:
-                    update_state = (train_state, traj_batch, advantages, targets, rng)
+                update_state = (train_state, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
-
+            
             if config["PARAMETER_SHARING"]:
                 update_state = (train_state, traj_batch, advantages, targets, rng)
                 update_state, loss_info = jax.lax.scan(
@@ -783,10 +483,7 @@ def make_train(config):
                 update_state_dict = []
                 metric = []
                 for i in range(env.num_agents):
-                    if recurrent_moa:
-                        update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], init_policy_hstate[i], init_moa_hstate[i], rng)
-                    else:
-                        update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], rng)
+                    update_state = (train_state[i], traj_batch[i], advantages[i], targets[i], rng)
                     update_state, loss_info = jax.lax.scan(
                         lambda state, unused: _update_epoch(state, unused, i), update_state, None, config["UPDATE_EPOCHS"]
                     )
@@ -794,19 +491,9 @@ def make_train(config):
                     train_state[i] = update_state[0]
                     metric_i = traj_batch[i].info
                     metric_i['loss'] = loss_info[0]
-                    if recurrent_moa:
-                        # Surface the loss components that were being computed and
-                        # immediately discarded -- needed to tell "policy instability"
-                        # apart from "MOA-specific bug" instead of inferring blindly
-                        # from environment-level behavior.
-                        metric_i['value_loss'] = loss_info[1][0]
-                        metric_i['loss_actor'] = loss_info[1][1]
-                        metric_i['entropy'] = loss_info[1][2]
-                        metric_i['moa_loss_raw'] = loss_info[1][3]
-                        metric_i['moa_accuracy'] = loss_info[1][4]
                     metric.append(metric_i)
                     rng = update_state[-1]
-
+                
             def callback(metric):
                 wandb.log(metric)
 
@@ -827,17 +514,11 @@ def make_train(config):
             metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
             jax.debug.callback(callback, metric)
 
-            if recurrent_moa:
-                runner_state = (train_state, env_state, last_obs, policy_hstate, moa_hstate, update_step, rng)
-            else:
-                runner_state = (train_state, env_state, last_obs, update_step, rng)
+            runner_state = (train_state, env_state, last_obs, update_step, rng)
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        if recurrent_moa:
-            runner_state = (train_state, env_state, obsv, policy_hstate, moa_hstate, 0, _rng)
-        else:
-            runner_state = (train_state, env_state, obsv, 0, _rng)
+        runner_state = (train_state, env_state, obsv, 0, _rng)
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
