@@ -3,6 +3,8 @@
 from algorithms.utils.networks import (
     CNN,
     ActorCritic,
+    ActorCriticMOA,
+    ActorCriticMOARNN,
     Actor,
     Critic,
     SmallCNN,
@@ -35,6 +37,7 @@ from algorithms.utils.types import (
     Transition,
     MAPPOTransition,
     IRATTransition,
+    MOATransition,
 )
 
 from algorithms.utils.transfer_utils import (
@@ -45,6 +48,8 @@ __all__ = [
     # Network architectures
     "CNN",
     "ActorCritic",
+    "ActorCriticMOA",
+    "ActorCriticMOARNN",
     "Actor",
     "Critic",
     "SmallCNN",
@@ -67,6 +72,7 @@ __all__ = [
     "Transition",
     "MAPPOTransition",
     "IRATTransition",
+    "MOATransition",
     # TRANSFER utilities
     "s_from_ratio",
 ]
