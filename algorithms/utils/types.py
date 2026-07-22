@@ -28,6 +28,25 @@ class MAPPOTransition(NamedTuple):
     info: jnp.ndarray
 
 
+class MOATransition(NamedTuple):
+    """PPO transition augmented for the Model-of-Other-Agents social-influence reward.
+
+    `reward` already has the influence bonus mixed in by the time it's stored. `joint_action`
+    and `next_joint_action` ride along through minibatch shuffling so the MOA's cross-entropy
+    auxiliary loss can be recomputed against the correct next-step label during PPO updates,
+    even though temporal adjacency is destroyed by shuffling.
+    """
+    done: jnp.ndarray
+    action: jnp.ndarray
+    value: jnp.ndarray
+    reward: jnp.ndarray
+    log_prob: jnp.ndarray
+    obs: jnp.ndarray
+    info: jnp.ndarray
+    joint_action: jnp.ndarray
+    next_joint_action: jnp.ndarray
+
+
 class IRATTransition(NamedTuple):
     """IRAT dual-policy transition with separate individual/team heads."""
     global_done: jnp.ndarray
