@@ -25,16 +25,41 @@ def single_run(config, make_train, *, wandb_name):
     """One training run, saving + evaluating at the end."""
     config = OmegaConf.to_container(config)
 
-    # Reward suffix lets common/individual runs of the same env coexist on disk
-    # and in wandb. Hidden behind .get() so the runner still works for any
-    # legacy yaml that doesn't define REWARD.
+    # Suffix lets common/individual/influence/recurrent runs of the same env coexist on
+    # disk and in wandb -- this same suffix also builds the checkpoint filename below, so
+    # without it, differently-configured runs at the same seed silently overwrite each
+    # other's checkpoints, not just collide in the wandb legend. Hidden behind .get() so
+    # the runner still works for any legacy yaml that doesn't define these keys.
     reward = config.get("REWARD")
     suffix = f"_reward_{reward}" if reward else ""
+    if config.get("RECURRENT_MOA", False):
+        suffix += "_influence_rnn"
+    elif config.get("INFLUENCE_REWARD", False):
+        suffix += "_influence"
+    # Optional free-text label (pass via CLI: RUN_LABEL=stable) for telling apart runs
+    # that share every other flag -- e.g. two RECURRENT_MOA=True runs that differ only in
+    # UPDATE_EPOCHS have identical suffixes above and would otherwise collide in both the
+    # wandb name and the checkpoint filename built from this same suffix.
+    if config.get("RUN_LABEL"):
+        suffix += f"_{config['RUN_LABEL']}"
+
+    tags = ["IPPO", "RNN" if config.get("RECURRENT_MOA", False) else "FF"]
+    if config.get("INFLUENCE_REWARD", False):
+        tags.append("INFLUENCE")
+    # Three different mechanisms now share the INFLUENCE_REWARD flag (cleanup's MOA
+    # head, coins/harvest's shared-policy variant, coins/harvest's independent-policy
+    # variant) and PARAMETER_SHARING alone can't tell them apart -- both the MOA and
+    # independent-policy variants run with PARAMETER_SHARING=False. Each influence/*.yaml
+    # already names its own mechanism via WANDB_TAGS; just forward that instead of
+    # re-guessing it here.
+    tags.extend(config.get("WANDB_TAGS", []) or [])
+    if config.get("RUN_LABEL"):
+        tags.append(config["RUN_LABEL"])
 
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "FF"],
+        tags=tags,
         config=config,
         mode=config["WANDB_MODE"],
         name=f"{wandb_name}{suffix}",
