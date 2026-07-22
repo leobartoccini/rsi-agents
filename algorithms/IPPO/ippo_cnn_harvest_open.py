@@ -3,6 +3,7 @@ Based on PureJaxRL & jaxmarl Implementation of PPO
 """
 import jax
 import jax.numpy as jnp
+import distrax
 import optax
 from flax.training.train_state import TrainState
 # from flax.training import checkpoints
@@ -28,6 +29,15 @@ from algorithms.utils import (
 
 def make_train(config):
     env = socialjax.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    # No auxiliary "model of other agents" network for the influence reward, in either
+    # PARAMETER_SHARING mode (see ippo_cnn_coins.py for the original version of this):
+    #  - PARAMETER_SHARING=True (influence/enabled_shared.yaml): one policy shared
+    #    across agents already IS the exact model of every other agent.
+    #  - PARAMETER_SHARING=False (influence/enabled_independent.yaml): agents keep
+    #    separate policies, but each agent's reward computation is given direct read
+    #    access to every other agent's params during centralized training (never at
+    #    execution time) -- decentralized execution isn't broken since the reward is
+    #    only ever used for the training update, not for acting.
     if config["PARAMETER_SHARING"]:
         config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     else:
@@ -65,6 +75,8 @@ def make_train(config):
     def train(rng):
 
         # INIT NETWORK
+        influence_reward = config.get("INFLUENCE_REWARD", False)
+        action_dim = env.action_space().n
         if config["PARAMETER_SHARING"]:
             network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
         else:
@@ -130,12 +142,14 @@ def make_train(config):
                     env_act = {}
                     log_prob = []
                     value = []
+                    pi_list = []
                     for i in range(env.num_agents):
                         pi, value_i = network[i].apply(train_state[i].params, obs_batch[i])
                         action = pi.sample(seed=_rng)
                         log_prob.append(pi.log_prob(action))
                         env_act[env.agents[i]] = action
                         value.append(value_i)
+                        pi_list.append(pi)
 
                 # env_act = {k: v.flatten() for k, v in env_act.items()}
                 env_act = [v for v in env_act.values()]
@@ -143,18 +157,169 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+                env_state_t = env_state  # pre-step state, needed below for counterfactuals
 
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0)
-                )(rng_step, env_state, env_act)
+                )(rng_step, env_state_t, env_act)
+
+                # SOCIAL INFLUENCE REWARD, MOA-free. No auxiliary network: "what would
+                # agent j do differently" is answered by literally re-running env.step
+                # with the SAME rng_step and SAME pre-step env_state_t, swapping only
+                # agent k's action, and asking a real policy about the resulting real
+                # (not approximated) observation. Costs num_agents x action_dim extra
+                # env.step calls per real step -- with 7 agents x 8 actions that's 56,
+                # noticeably heavier than coins' 14. Two variants depending on
+                # architecture:
+                #  - PARAMETER_SHARING=True: one network answers for every agent.
+                #  - PARAMETER_SHARING=False: each agent keeps its own network, but the
+                #    reward computation is given direct read access to every other
+                #    agent's params (fine for a training-time-only quantity -- it never
+                #    touches how actions get chosen, so decentralized execution still
+                #    holds).
+                if influence_reward:
+                    obs_shape = (env.observation_space()[0]).shape
+                    not_self = jnp.array(
+                        [[j != k for j in range(env.num_agents)] for k in range(env.num_agents)]
+                    )  # (k, j)
+
+                    # Only count influence over agents k can actually SEE this step --
+                    # with up to 7 agents on an open grid, most pairs are nowhere near
+                    # each other at any given moment, and there's no causal story for
+                    # "I influenced an agent whose observation couldn't possibly have
+                    # been affected by anything I did." Visibility is derived from the
+                    # env's own observation-window geometry (env.get_obs_point), not
+                    # re-implemented: agent j is visible to k iff j's (padded) position
+                    # falls inside the OBS_SIZE x OBS_SIZE crop centered (direction-
+                    # adjusted) on k, exactly the same window _get_obs uses to build k's
+                    # actual observation.
+                    def _visibility(agent_locs):  # agent_locs: (num_agents, 3) for one env
+                        start_x, start_y = jax.vmap(env.get_obs_point)(agent_locs)  # each (num_agents,)
+                        px = agent_locs[:, 0] + env.PADDING
+                        py = agent_locs[:, 1] + env.PADDING
+                        in_x = (px[None, :] >= start_x[:, None]) & (px[None, :] < start_x[:, None] + env.OBS_SIZE)
+                        in_y = (py[None, :] >= start_y[:, None]) & (py[None, :] < start_y[:, None] + env.OBS_SIZE)
+                        return in_x & in_y  # (k, j)
+
+                    visible = jax.vmap(_visibility)(env_state_t.env_state.agent_locs)  # (NUM_ENVS, k, j)
+
+                    def _safe_kl(cond_probs, marginal_probs):
+                        # As training progresses the policy gets more peaked (low
+                        # ENT_COEF), and any category can underflow to exact float32
+                        # 0.0 after enough softmax/einsum compounding. Categorical KL
+                        # is log(p/q) under the hood -- an exact-zero q with nonzero p
+                        # there blows up to +inf, poisoning the whole update (Adam's
+                        # moments stay NaN forever once hit). Clip-and-renormalize
+                        # keeps every category strictly positive so KL stays finite.
+                        eps = 1e-6
+                        cond_safe = cond_probs + eps
+                        cond_safe = cond_safe / cond_safe.sum(-1, keepdims=True)
+                        marginal_safe = marginal_probs + eps
+                        marginal_safe = marginal_safe / marginal_safe.sum(-1, keepdims=True)
+                        return distrax.Categorical(probs=cond_safe).kl_divergence(
+                            distrax.Categorical(probs=marginal_safe)
+                        )
+
+                    if config["PARAMETER_SHARING"]:
+                        act_probs = pi.probs.reshape(env.num_agents, config["NUM_ENVS"], action_dim)
+
+                        # Real conditional: what agents actually do next, given the real
+                        # joint action that was actually taken -- already have obsv for free.
+                        obsv_flat = jnp.transpose(obsv, (1, 0, 2, 3, 4)).reshape(-1, *obs_shape)
+                        cond_pi, _ = network.apply(train_state.params, obsv_flat)
+                        cond_probs = cond_pi.probs.reshape(env.num_agents, config["NUM_ENVS"], action_dim)
+
+                        influence = []
+                        for k in range(env.num_agents):
+                            def _cf_obs(a_idx, k=k):
+                                cf_act = [
+                                    jnp.where(i == k, jnp.full_like(env_act[i], a_idx), env_act[i])
+                                    for i in range(env.num_agents)
+                                ]
+                                cf_obsv, _, _, _, _ = jax.vmap(
+                                    env.step, in_axes=(0, 0, 0)
+                                )(rng_step, env_state_t, cf_act)
+                                return cf_obsv  # (NUM_ENVS, num_agents, *obs_shape)
+
+                            cf_obsv_all = jax.vmap(_cf_obs)(jnp.arange(action_dim))
+                            cf_obsv_flat = jnp.transpose(
+                                cf_obsv_all, (0, 2, 1, 3, 4, 5)
+                            ).reshape(-1, *obs_shape)
+                            cf_pi, _ = network.apply(train_state.params, cf_obsv_flat)
+                            cf_probs = cf_pi.probs.reshape(
+                                action_dim, env.num_agents, config["NUM_ENVS"], action_dim
+                            )
+
+                            # Marginalize the counterfactuals over agent k's own real policy.
+                            marginal_probs = jnp.einsum("ea,ajet->jet", act_probs[k], cf_probs)
+                            kl_per_j = _safe_kl(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
+
+                            # visible[:, k, :] is (NUM_ENVS, j); transpose to (j, NUM_ENVS)
+                            # to line up with kl_per_j, and AND in not_self so k is never
+                            # counted as influencing itself even though k trivially sees k.
+                            mask_k = visible[:, k, :].T & not_self[k][:, None]
+                            influence.append(jnp.sum(jnp.where(mask_k, kl_per_j, 0.0), axis=0))
+                    else:
+                        # Same idea, but each agent j's conditional/counterfactual query
+                        # goes through agent j's OWN network/params rather than one
+                        # shared call -- that's literally agent j's real policy, so this
+                        # is the exact (not approximated) model of every other agent.
+                        cond_probs = jnp.stack(
+                            [
+                                network[j].apply(train_state[j].params, obsv[:, j])[0].probs
+                                for j in range(env.num_agents)
+                            ],
+                            axis=0,
+                        )  # (num_agents, NUM_ENVS, action_dim)
+
+                        influence = []
+                        for k in range(env.num_agents):
+                            def _cf_obs(a_idx, k=k):
+                                cf_act = [
+                                    jnp.where(i == k, jnp.full_like(env_act[i], a_idx), env_act[i])
+                                    for i in range(env.num_agents)
+                                ]
+                                cf_obsv, _, _, _, _ = jax.vmap(
+                                    env.step, in_axes=(0, 0, 0)
+                                )(rng_step, env_state_t, cf_act)
+                                return cf_obsv  # (NUM_ENVS, num_agents, *obs_shape)
+
+                            cf_obsv_all = jax.vmap(_cf_obs)(jnp.arange(action_dim))  # (a, NUM_ENVS, num_agents, *obs_shape)
+                            cf_probs = jnp.stack(
+                                [
+                                    network[j].apply(
+                                        train_state[j].params,
+                                        cf_obsv_all[:, :, j].reshape(-1, *obs_shape),
+                                    )[0].probs.reshape(action_dim, config["NUM_ENVS"], action_dim)
+                                    for j in range(env.num_agents)
+                                ],
+                                axis=1,
+                            )  # (a, j, e, t)
+
+                            # Marginalize the counterfactuals over agent k's own real policy.
+                            marginal_probs = jnp.einsum("ea,ajet->jet", pi_list[k].probs, cf_probs)
+                            kl_per_j = _safe_kl(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
+
+                            mask_k = visible[:, k, :].T & not_self[k][:, None]
+                            influence.append(jnp.sum(jnp.where(mask_k, kl_per_j, 0.0), axis=0))
+
+                    influence = jnp.stack(influence, axis=0)  # (num_agents, NUM_ENVS)
+
+                    # Constant weight, no curriculum ramp -- full strength from step 0.
+                    beta = config["INFLUENCE_WEIGHT"]
+                    done_env = done["__all__"]
+                    influence = influence * (1.0 - done_env.astype(jnp.float32))[None, :]
+                    reward = reward + beta * influence.T
 
                 # current_timestep = update_step*config["NUM_STEPS"]*config["NUM_ENVS"]
                 # shaped_reward = compute_grouped_rewards(reward)
                 # reward = jax.tree.map(lambda x,y: x*rew_shaping_anneal_org(current_timestep)+y*rew_shaping_anneal(current_timestep), reward, shaped_reward)
 
-                
+
                 if config["PARAMETER_SHARING"]:
                     info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                    if influence_reward:
+                        info["influence_reward"] = influence.T.reshape(-1)
                     transition = Transition(
                         batchify_dict(done, env.agents, config["NUM_ACTORS"]).squeeze(),
                         action,
@@ -169,6 +334,8 @@ def make_train(config):
                     done = [v for v in done.values()]
                     for i in range(env.num_agents):
                         info_i = {key: jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"]),1), value[:,i]) for key, value in info.items()}
+                        if influence_reward:
+                            info_i["influence_reward"] = influence[i].reshape((config["NUM_ACTORS"], 1))
                         transition.append(Transition(
                             done[i],
                             env_act[i],
