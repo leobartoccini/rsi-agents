@@ -237,6 +237,66 @@ class ActorCriticMOARNN(nn.Module):
         return (z, z)
 
 
+class ActorCriticLSTM(nn.Module):
+    """
+    Recurrent Actor-Critic whose main policy/value pathway is conditioned on the
+    other agent(s)' action, not just the ego agent's own observation.
+
+    Unlike ActorCriticMOARNN (which keeps the other-agent-conditioned head separate,
+    as an auxiliary MOA prediction bolted onto an otherwise ordinary policy), this
+    network feeds the other agent's action one-hot directly into the main pathway:
+    CNN -> concat with other agent's action -> two FC layers -> LSTM -> actor/critic
+    heads. So the acting policy itself, not just an auxiliary head, sees what the
+    other agent did.
+
+    `other_action_onehot` follows the same joint-action convention used elsewhere in
+    this file (shape (..., num_agents, action_dim)) so counterfactual callers can
+    swap in a hypothetical action the same way they do for ActorCriticMOA/RNN's
+    `joint_action_onehot` -- it's on the caller to zero out the ego agent's own slot
+    if "other" should exclude self.
+
+    Attributes:
+        action_dim: Number of discrete actions
+        num_agents: Total number of agents (sizes the flattened action input)
+        hidden_dim: LSTM hidden size
+        activation: Activation function name ("relu" or "tanh")
+    """
+    action_dim: int
+    num_agents: int
+    hidden_dim: int = 128
+    activation: str = "relu"
+
+    def setup(self):
+        self.cnn = CNN(self.activation)
+
+        self.fc1 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.fc2 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.lstm = nn.LSTMCell(features=self.hidden_dim)
+        self.actor_out = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))
+        self.critic_out = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
+
+    def _activation_fn(self, x):
+        return nn.relu(x) if self.activation == "relu" else nn.tanh(x)
+
+    def __call__(self, carry, obs, other_action_onehot):
+        embedding = self.cnn(obs)
+        flat_other_action = other_action_onehot.reshape(*other_action_onehot.shape[:-2], -1)
+        x = jnp.concatenate([embedding, flat_other_action], axis=-1)
+        h = self._activation_fn(self.fc1(x))
+        h = self._activation_fn(self.fc2(h))
+        new_carry, h = self.lstm(carry, h)
+
+        pi = distrax.Categorical(logits=self.actor_out(h))
+        value = jnp.squeeze(self.critic_out(h), axis=-1)
+
+        return new_carry, (pi, value)
+
+    @staticmethod
+    def initialize_carry(batch_size, hidden_dim):
+        z = jnp.zeros((batch_size, hidden_dim))
+        return (z, z)
+
+
 class Actor(nn.Module):
     """
     Standalone Actor network for MAPPO algorithm.
