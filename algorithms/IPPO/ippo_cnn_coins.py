@@ -1,10 +1,17 @@
 """
 Based on PureJaxRL & jaxmarl Implementation of PPO
 """
+import itertools
+from typing import Any
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+from scipy.stats import spearmanr, pearsonr
+import chex
 import distrax
 import optax
+import flashbax as fbx
 from flax.training.train_state import TrainState
 # from flax.training import checkpoints
 from gymnax.wrappers.purerl import LogWrapper
@@ -20,6 +27,7 @@ from algorithms.utils import (
     ActorCritic,
     ActorCriticMOARNN,
     ActorCriticLSTM,
+    ValueInfluenceEstimator,
     batchify,
     batchify_dict,
     unbatchify,
@@ -41,9 +49,34 @@ def reset_hstate(carry, done_env):
     return (jnp.where(mask, 0.0, c), jnp.where(mask, 0.0, h))
 
 
+class ValueInfluenceTrainState(TrainState):
+    """TrainState for the Value-Influence Q-estimator (ValueInfluenceEstimator),
+    carrying a frozen target_network_params alongside the trainable params -- mirrors
+    CustomTrainState in algorithms/VDN/vdn_cnn_coins.py. `params` is the ONLINE network
+    (trained periodically off the replay buffer below); `target_network_params` is what
+    the reward computation in _env_step actually reads, synced from `params` only every
+    VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL updates -- this is what keeps the reward
+    signal from chasing a network that's simultaneously chasing it.
+    """
+    target_network_params: Any
+
+
+@chex.dataclass(frozen=True)
+class QTimestep:
+    """One (obs, joint_action, target) sample for the Value-Influence Q-estimator's
+    replay buffer -- mirrors the Timestep dataclass in algorithms/VDN/vdn_cnn_coins.py.
+    `target` is the EXTRINSIC-only, self-bootstrapped GAE target (see the second
+    _calculate_gae call in _update_step), never the policy's own (shaped-reward) GAE
+    target."""
+    obs: chex.Array          # (num_agents, *obs_shape)
+    joint_action_onehot: chex.Array  # (num_agents, action_dim)
+    target: chex.Array       # (num_agents,)
+    done: chex.Array         # ()
+
+
 def make_train(config):
     env = socialjax.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    # Four ways to get a social-influence reward here, picked by config flags:
+    # Five ways to get a social-influence reward here, picked by config flags:
     #  - PARAMETER_SHARING=True + INFLUENCE_REWARD=True (influence/enabled_shared.yaml):
     #    no MOA network -- the one shared policy already IS the exact model of every
     #    other agent.
@@ -60,19 +93,114 @@ def make_train(config):
     #    agent's previous action, so the "real" conditional is just the ordinary
     #    policy output and the counterfactual is the same network re-called with a
     #    hypothetical previous action -- no MOA loss, no env.step resimulation.
+    #  - PARAMETER_SHARING=False + INFLUENCE_REWARD=True + VALUE_INFLUENCE_MULT/SUM/DIFF=True
+    #    (influence/value_influence_*.yaml): same MOA-free env.step-resimulation
+    #    mechanism as enabled_independent.yaml (no LSTM, no auxiliary network), but
+    #    the KL-based influence magnitude I is additionally combined with delta_v --
+    #    reusing the same counterfactual observations/values already computed for the
+    #    KL term. Same three combination modes also work with LSTM_INFLUENCE=True.
+    #
+    # LSTM_INFLUENCE can also be used with INFLUENCE_REWARD=False: that keeps the
+    # recurrent, previous-action-conditioned ActorCriticLSTM architecture (still
+    # useful on its own -- the policy gets to see what the other agent just did) but
+    # skips the counterfactual/KL reward computation entirely rather than just
+    # zeroing its contribution, since INFLUENCE_WEIGHT/beta only ever get read inside
+    # `if influence_reward:` guards below.
     if config.get("RECURRENT_MOA", False):
         assert config.get("INFLUENCE_REWARD", False) and not config["PARAMETER_SHARING"], (
             "RECURRENT_MOA requires INFLUENCE_REWARD=True and PARAMETER_SHARING=False "
             "(see influence/enabled_recurrent.yaml)."
         )
     if config.get("LSTM_INFLUENCE", False):
-        assert config.get("INFLUENCE_REWARD", False) and not config["PARAMETER_SHARING"], (
-            "LSTM_INFLUENCE requires INFLUENCE_REWARD=True and PARAMETER_SHARING=False "
-            "(see influence/enabled_lstm.yaml)."
+        assert not config["PARAMETER_SHARING"], (
+            "LSTM_INFLUENCE requires PARAMETER_SHARING=False -- each agent needs its "
+            "own distinguishable network for 'the other agent's previous action' to "
+            "mean anything (see influence/enabled_lstm.yaml)."
         )
         assert not config.get("RECURRENT_MOA", False), (
             "LSTM_INFLUENCE and RECURRENT_MOA select different network architectures "
             "for the same INFLUENCE_REWARD flag -- pick one, not both."
+        )
+    # VALUE_INFLUENCE_MULT/SUM/DIFF/DIFF2/VALUE/VALUE_DIFF are six mutually-exclusive
+    # ways to turn delta_v (how much the acting agent's real action raised or lowered
+    # another agent's value, relative to what its own real policy would have produced
+    # on average) into an intrinsic reward, optionally combined with the KL-based
+    # influence magnitude I. MULT/SUM/DIFF/DIFF2 replace the old
+    # INFLUENCE_SIGNED/LSTM_INFLUENCE_SIGNED booleans (which only ever did "mult") and
+    # work with either the feedforward MOA-free path (PARAMETER_SHARING True or
+    # False) or LSTM_INFLUENCE. VALUE/VALUE_DIFF are LSTM_INFLUENCE-only (see the
+    # assert below) -- see the value_influence_mode branches in _env_step:
+    #  - mult:       r^WAI = I * delta_v (the original welfare-aware-influence formula)
+    #  - sum:        r = I + lambda*delta_v
+    #  - diff:       r = I + lambda*(delta_v_(k->j) - delta_v_(j->k)) -- how much k
+    #    influenced j's value minus how much j influenced k's value back
+    #  - diff2:      r = I * (delta_v_(k->j) - delta_v_(j->k)) -- same net value effect
+    #    as diff, but multiplied by I instead of added to it
+    #  - value:      r = delta_v alone -- no KL-influence term I at all
+    #  - value_diff: r = delta_v_(k->j) - delta_v_(j->k) alone -- no I at all
+    #
+    # mult_sep/sum_sep/diff_sep/diff2_sep are FOUR SEPARATE, self-contained
+    # implementations of the mult/sum/diff/diff2 formulas above -- same formulas, but
+    # delta_v comes from a fully independent ValueInfluenceEstimator Q-network (own
+    # CNN/FC/LSTM, own optimizer, periodically-synced frozen target copy) instead of
+    # ActorCriticLSTM's own value head, so the intrinsic reward is never derived from
+    # the exact critic PPO is simultaneously updating with that same reward (gradient
+    # isolation + target stability). Deliberately NOT sharing code with
+    # mult/sum/diff/diff2 above -- each _sep mode has its own complete KL +
+    # qnet-value + combine block in _env_step, so nothing about the six modes above
+    # is touched by this. LSTM_INFLUENCE-only, like VALUE/VALUE_DIFF -- the qnet
+    # needs the same recurrent carry (qnet_hstate) threading LSTM_INFLUENCE already
+    # sets up for the policy.
+    value_influence_flags = {
+        "mult": config.get("VALUE_INFLUENCE_MULT", False),
+        "sum": config.get("VALUE_INFLUENCE_SUM", False),
+        "diff": config.get("VALUE_INFLUENCE_DIFF", False),
+        "diff2": config.get("VALUE_INFLUENCE_DIFF2", False),
+        "value": config.get("VALUE_INFLUENCE_VALUE", False),
+        "value_diff": config.get("VALUE_INFLUENCE_VALUE_DIFF", False),
+        "mult_sep": config.get("VALUE_INFLUENCE_MULT_SEP", False),
+        "sum_sep": config.get("VALUE_INFLUENCE_SUM_SEP", False),
+        "diff_sep": config.get("VALUE_INFLUENCE_DIFF_SEP", False),
+        "diff2_sep": config.get("VALUE_INFLUENCE_DIFF2_SEP", False),
+    }
+    assert sum(bool(v) for v in value_influence_flags.values()) <= 1, (
+        "VALUE_INFLUENCE_MULT/SUM/DIFF/DIFF2/VALUE/VALUE_DIFF/*_SEP are mutually "
+        "exclusive -- pick at most one combination mode."
+    )
+    if any(value_influence_flags.values()):
+        assert config.get("INFLUENCE_REWARD", False) and not config.get("RECURRENT_MOA", False), (
+            "VALUE_INFLUENCE_MULT/SUM/DIFF/DIFF2/VALUE/VALUE_DIFF/*_SEP requires "
+            "INFLUENCE_REWARD=True and is incompatible with RECURRENT_MOA "
+            "(see config/influence/value_influence_*.yaml, value_lstm.yaml, "
+            "value_diff_lstm.yaml)."
+        )
+    _sep_modes = ("mult_sep", "sum_sep", "diff_sep", "diff2_sep")
+    if value_influence_flags["value"] or value_influence_flags["value_diff"] or any(
+        value_influence_flags[m] for m in _sep_modes
+    ):
+        assert config.get("LSTM_INFLUENCE", False), (
+            "VALUE_INFLUENCE_VALUE/VALUE_DIFF/*_SEP are only implemented in the "
+            "LSTM_INFLUENCE path -- the feedforward branches don't handle these modes "
+            "(see value_lstm.yaml / value_diff_lstm.yaml / "
+            "value_influence_*_lstm_sep.yaml). Use mult/sum/diff/diff2 outside "
+            "LSTM_INFLUENCE."
+        )
+    # VALUE_INEQUITY_AVERSION: same u_k = r_k - penalty formula as
+    # get_inequity_aversion_rewards_immediate() in coin_game.py, but built from the
+    # critic's value estimates V_k instead of the immediate reward r_k -- V is a
+    # smoother, longer-horizon proxy for "how well agent k is doing" than a single
+    # step's reward, playing the same role the env's own `smooth_rewards`
+    # exponential-average option does for the immediate-reward version. Computed here
+    # (not in the env) because the env has no access to the critic. Works with every
+    # branch below (PARAMETER_SHARING, recurrent_moa, lstm_influence, independent) --
+    # all of them already compute a pre-step value estimate per agent during action
+    # selection, which is what this reuses.
+    value_inequity_aversion = config.get("VALUE_INEQUITY_AVERSION", False)
+    if value_inequity_aversion:
+        assert not config["ENV_KWARGS"].get("inequity_aversion", False), (
+            "VALUE_INEQUITY_AVERSION and ENV_KWARGS.inequity_aversion both shape the "
+            "reward for inequity -- one from the value function, one from the immediate "
+            "reward -- so stacking them double-penalizes the same inequity. Pick one."
         )
     if config["PARAMETER_SHARING"]:
         config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -114,6 +242,53 @@ def make_train(config):
         influence_reward = config.get("INFLUENCE_REWARD", False)
         recurrent_moa = config.get("RECURRENT_MOA", False)
         lstm_influence = config.get("LSTM_INFLUENCE", False)
+        # Which welfare-aware combination (if any) to apply to the KL-based influence
+        # magnitude I -- see the value_influence_flags assertion above for what each
+        # mode means. None means plain (unsigned) influence reward, same as before
+        # INFLUENCE_SIGNED/LSTM_INFLUENCE_SIGNED existed. Works identically whether
+        # the active path ends up being the LSTM-conditioned one (lstm_influence
+        # below) or the feedforward MOA-free one.
+        value_influence_mode = next(
+            (mode for mode, flag in (
+                ("mult", config.get("VALUE_INFLUENCE_MULT", False)),
+                ("sum", config.get("VALUE_INFLUENCE_SUM", False)),
+                ("diff", config.get("VALUE_INFLUENCE_DIFF", False)),
+                ("diff2", config.get("VALUE_INFLUENCE_DIFF2", False)),
+                ("value", config.get("VALUE_INFLUENCE_VALUE", False)),
+                ("value_diff", config.get("VALUE_INFLUENCE_VALUE_DIFF", False)),
+                ("mult_sep", config.get("VALUE_INFLUENCE_MULT_SEP", False)),
+                ("sum_sep", config.get("VALUE_INFLUENCE_SUM_SEP", False)),
+                ("diff_sep", config.get("VALUE_INFLUENCE_DIFF_SEP", False)),
+                ("diff2_sep", config.get("VALUE_INFLUENCE_DIFF2_SEP", False)),
+            ) if flag),
+            None,
+        )
+        # mult_sep/sum_sep/diff_sep/diff2_sep use a fully separate Q-network
+        # (ValueInfluenceEstimator) for delta_v instead of ActorCriticLSTM's value
+        # head -- see the value_influence_flags comment above for why. Everything
+        # below gated on this bool (qnet instantiation, qnet_hstate, the buffer, the
+        # learn phase) only exists when one of these four modes is active.
+        _sep_modes = ("mult_sep", "sum_sep", "diff_sep", "diff2_sep")
+        value_influence_use_qnet = value_influence_mode in _sep_modes
+        # Weight on the delta_v term in the LSTM path's "sum" mode (I + lambda*delta_v)
+        # and "diff" mode (I + lambda*(delta_v_(k->j) - delta_v_(j->k))) -- a second,
+        # independent knob alongside INFLUENCE_WEIGHT/beta (which scales the WHOLE
+        # combined term when added to reward), letting delta_v's contribution be tuned
+        # relative to the KL-influence term I itself. Only read/applied in the
+        # lstm_influence branch's "sum"/"diff" cases below -- "mult" and "diff2" scale
+        # delta_v multiplicatively through I already, and the non-LSTM feedforward path
+        # doesn't use it.
+        value_influence_lambda = config.get("VALUE_INFLUENCE_LAMBDA", 1.0)
+        value_inequity_aversion = config.get("VALUE_INEQUITY_AVERSION", False)
+        value_inequity_alpha = config.get("VALUE_INEQUITY_AVERSION_ALPHA", 5)
+        value_inequity_beta = config.get("VALUE_INEQUITY_AVERSION_BETA", 0.05)
+        # Number of update-windows' worth of raw per-timestep data to accumulate before
+        # computing the live Group B behavioral metrics (conditional cooperation,
+        # retaliation lag, forgiveness rate, influence/delta_v-vs-extrinsic-reward
+        # correlation) -- see _flush_group_b_metrics below. A single NUM_STEPS window is
+        # usually shorter than a real episode (num_inner_steps), so these are computed
+        # over a K-update rolling buffer instead of every update.
+        metrics_window_updates = config.get("METRICS_WINDOW_UPDATES", 50)
         hidden_dim = config.get("LSTM_HIDDEN_DIM", 128)
         action_dim = env.action_space().n
         if config["PARAMETER_SHARING"]:
@@ -186,6 +361,66 @@ def make_train(config):
                 tx=tx,
             ) for i in range(env.num_agents)]
 
+        if value_influence_use_qnet:
+            # Fully separate Q-network for delta_v in the mult_sep/sum_sep/diff_sep/
+            # diff2_sep modes -- own architecture, own params, own optimizer, never
+            # shares tx/optimizer state with the policy's train_state above. Only
+            # `qnet_train_state[i].target_network_params` (synced from `.params` every
+            # VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL updates, see the learn phase in
+            # _update_step) is ever read when computing the reward -- `.params` itself
+            # is only touched by the periodic learn-phase gradient step.
+            qnet_lr = config.get("VALUE_INFLUENCE_Q_LR", config["LR"])
+            qnet_tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(qnet_lr, eps=1e-5),
+            )
+            qnet = [
+                ValueInfluenceEstimator(
+                    num_agents=env.num_agents, action_dim=action_dim,
+                    hidden_dim=hidden_dim, activation=config["ACTIVATION"],
+                ) for _ in range(env.num_agents)
+            ]
+            rng, _rng = jax.random.split(rng)
+            init_qh_1 = ValueInfluenceEstimator.initialize_carry(1, hidden_dim)
+            qnet_params = [
+                qnet[i].init(_rng, init_qh_1, init_x, init_joint_action)
+                for i in range(env.num_agents)
+            ]
+            qnet_train_state = [
+                ValueInfluenceTrainState.create(
+                    apply_fn=qnet[i].apply, params=p, target_network_params=p, tx=qnet_tx,
+                ) for i, p in enumerate(qnet_params)
+            ]
+
+            # Replay buffer of short (obs, joint_action_onehot, extrinsic-only GAE
+            # target) SEQUENCES -- a flashbax trajectory buffer, not a flat buffer,
+            # specifically so the qnet's LSTM carry can be genuinely unrolled across a
+            # sampled chunk (with burn-in for chunks starting mid-episode, see the
+            # learn phase in _update_step) instead of fed a cold zero-carry per
+            # independent sample.
+            qnet_buffer_seq_len = config.get("VALUE_INFLUENCE_BUFFER_SEQ_LEN", 12)
+            qnet_buffer = fbx.make_trajectory_buffer(
+                add_batch_size=config["NUM_ENVS"],
+                sample_batch_size=config.get("VALUE_INFLUENCE_BUFFER_BATCH_SIZE", 32),
+                sample_sequence_length=qnet_buffer_seq_len,
+                period=config.get("VALUE_INFLUENCE_BUFFER_PERIOD", max(qnet_buffer_seq_len // 2, 1)),
+                min_length_time_axis=config.get("VALUE_INFLUENCE_BUFFER_MIN_LENGTH", qnet_buffer_seq_len * 4),
+                max_size=config.get("VALUE_INFLUENCE_BUFFER_MAX_SIZE", 200_000),
+            )
+            qnet_buffer = qnet_buffer.replace(
+                init=jax.jit(qnet_buffer.init),
+                add=jax.jit(qnet_buffer.add, donate_argnums=0),
+                sample=jax.jit(qnet_buffer.sample),
+                can_sample=jax.jit(qnet_buffer.can_sample),
+            )
+            _dummy_qtimestep = QTimestep(
+                obs=jnp.zeros((env.num_agents, *(env.observation_space()[0]).shape)),
+                joint_action_onehot=jnp.zeros((env.num_agents, action_dim)),
+                target=jnp.zeros((env.num_agents,)),
+                done=jnp.array(False),
+            )
+            qnet_buffer_state = qnet_buffer.init(_dummy_qtimestep)
+
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
@@ -221,23 +456,47 @@ def make_train(config):
             # spuriously credit/blame a fictitious action.
             prev_joint_action = jnp.full((config["NUM_ENVS"], env.num_agents), -1, dtype=jnp.int32)
             prev_action_probs = jnp.full((env.num_agents, config["NUM_ENVS"], action_dim), 1.0 / action_dim)
+            if value_influence_use_qnet:
+                # qnet's own recurrent carry, threaded through runner_state exactly
+                # like policy_hstate (updated from the REAL, non-counterfactual
+                # forward call each _env_step, reset on done) -- separate from
+                # policy_hstate since it belongs to a completely different network.
+                qnet_hstate = [ValueInfluenceEstimator.initialize_carry(config["NUM_ENVS"], hidden_dim) for _ in range(env.num_agents)]
 
         # TRAIN LOOP
         def _update_step(runner_state, unused):
+            # Outer carry is (env_runner_state, metrics_buffer) -- or, when a
+            # mult_sep/sum_sep/diff_sep/diff2_sep mode is active,
+            # (env_runner_state, metrics_buffer, qnet_train_state, qnet_buffer_state).
+            # metrics_buffer/qnet_train_state/qnet_buffer_state are all untouched by
+            # _env_step (only read/written here, once per update), so unpacking them
+            # here and re-nesting at the bottom keeps every existing
+            # env_runner_state-shaped branch below (recurrent_moa/lstm_influence/else)
+            # completely unchanged.
+            if value_influence_use_qnet:
+                runner_state, metrics_buffer, qnet_train_state, qnet_buffer_state = runner_state
+            else:
+                runner_state, metrics_buffer = runner_state
             if recurrent_moa:
                 # Snapshot the carries entering this rollout window -- they were already
                 # correctly reset in real time during the previous window's collection, so
                 # the loss's time-scan can use them as-is with no reset check at step 0.
                 _, _, _, init_policy_hstate, init_moa_hstate, _, _ = runner_state
             elif lstm_influence:
-                _, _, _, init_policy_hstate, _, _, _, _ = runner_state
+                if value_influence_use_qnet:
+                    _, _, _, init_policy_hstate, init_qnet_hstate, _, _, _, _ = runner_state
+                else:
+                    _, _, _, init_policy_hstate, _, _, _, _ = runner_state
 
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
                 if recurrent_moa:
                     train_state, env_state, last_obs, policy_hstate, moa_hstate, update_step, rng = runner_state
                 elif lstm_influence:
-                    train_state, env_state, last_obs, policy_hstate, prev_joint_action, prev_action_probs, update_step, rng = runner_state
+                    if value_influence_use_qnet:
+                        train_state, env_state, last_obs, policy_hstate, qnet_hstate, prev_joint_action, prev_action_probs, update_step, rng = runner_state
+                    else:
+                        train_state, env_state, last_obs, policy_hstate, prev_joint_action, prev_action_probs, update_step, rng = runner_state
                 else:
                     train_state, env_state, last_obs, update_step, rng = runner_state
 
@@ -336,7 +595,7 @@ def make_train(config):
                     joint_action_onehot = jax.nn.one_hot(joint_action, action_dim)
 
                     current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                    beta = config["INFLUENCE_WEIGHT"] * rew_shaping_anneal(current_timestep)
+                    beta = config["INFLUENCE_WEIGHT"]
 
                     influence = []
                     new_moa_hstate = []
@@ -389,99 +648,339 @@ def make_train(config):
 
                     influence = jnp.stack(influence, axis=-1)  # (NUM_ENVS, num_agents)
                 elif lstm_influence:
-                    # SOCIAL INFLUENCE REWARD -- LSTM variant. No auxiliary network at
-                    # all: the MAIN policy already conditions on the previous timestep's
-                    # real joint action (fed in above for action selection), so agent j's
-                    # REAL conditional is just pi_list[j] -- already computed for free.
-                    # The counterfactual re-calls each agent j's SAME network with the
-                    # SAME incoming carry/obs but agent k's slot in that previous-action
-                    # input swapped to a hypothetical action -- no env.step needed at all.
-                    cond_probs = jnp.stack(
-                        [pi_list[j].probs for j in range(env.num_agents)], axis=0
-                    )  # (j, e, t) -- REAL
+                    if influence_reward and not value_influence_use_qnet:
+                        # SOCIAL INFLUENCE REWARD -- LSTM variant. No auxiliary network at
+                        # all: the MAIN policy already conditions on the previous timestep's
+                        # real joint action (fed in above for action selection), so agent j's
+                        # REAL conditional is just pi_list[j] -- already computed for free.
+                        # The counterfactual re-calls each agent j's SAME network with the
+                        # SAME incoming carry/obs but agent k's slot in that previous-action
+                        # input swapped to a hypothetical action -- no env.step needed at all.
+                        cond_probs = jnp.stack(
+                            [pi_list[j].probs for j in range(env.num_agents)], axis=0
+                        )  # (j, e, t) -- REAL
 
-                    current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                    beta = config["INFLUENCE_WEIGHT"] * rew_shaping_anneal(current_timestep)
+                        current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
+                        beta = config["INFLUENCE_WEIGHT"] * rew_shaping_anneal(current_timestep)
 
-                    def _safe_kl_lstm(cond_probs, marginal_probs):
-                        eps = 1e-6
-                        cond_safe = cond_probs + eps
-                        cond_safe = cond_safe / cond_safe.sum(-1, keepdims=True)
-                        marginal_safe = marginal_probs + eps
-                        marginal_safe = marginal_safe / marginal_safe.sum(-1, keepdims=True)
-                        return distrax.Categorical(probs=cond_safe).kl_divergence(
-                            distrax.Categorical(probs=marginal_safe)
+                        def _safe_kl_lstm(cond_probs, marginal_probs):
+                            eps = 1e-6
+                            cond_safe = cond_probs + eps
+                            cond_safe = cond_safe / cond_safe.sum(-1, keepdims=True)
+                            marginal_safe = marginal_probs + eps
+                            marginal_safe = marginal_safe / marginal_safe.sum(-1, keepdims=True)
+                            return distrax.Categorical(probs=cond_safe).kl_divergence(
+                                distrax.Categorical(probs=marginal_safe)
+                            )
+
+                        def _apply_pi_value(j, other_action_onehot):
+                            # Grabbing value_j here is free -- the network already
+                            # computes it alongside pi_j in the same forward pass;
+                            # LSTM_INFLUENCE just never used to look at it.
+                            _, (pi_j, value_j) = network[j].apply(
+                                train_state[j].params, policy_hstate[j], obs_batch[j], other_action_onehot
+                            )
+                            return pi_j.probs, value_j
+
+                        if value_influence_mode is not None:
+                            # REAL value estimate for every agent, under the REAL
+                            # prev_joint_action -- already computed for free during
+                            # action selection (the `value` list), same free-lunch as
+                            # cond_probs reusing pi_list above.
+                            real_value = jnp.stack([value[j] for j in range(env.num_agents)], axis=0)  # (j, e)
+
+                        kl_list = []
+                        delta_v_list = []  # only populated when value_influence_mode is not None
+                        for k in range(env.num_agents):
+                            def _cf_probs_value(a_idx, k=k):
+                                cf_onehot = jax.nn.one_hot(a_idx, action_dim)
+                                cf_joint = prev_joint_action_onehot.at[:, k, :].set(cf_onehot)
+                                probs_list, value_list = zip(
+                                    *[_apply_pi_value(j, cf_joint) for j in range(env.num_agents)]
+                                )
+                                return jnp.stack(probs_list, axis=0), jnp.stack(value_list, axis=0)  # (j,e,t), (j,e)
+
+                            cf_probs, cf_values = jax.vmap(_cf_probs_value)(jnp.arange(action_dim))  # (a,j,e,t), (a,j,e)
+                            # Marginalize the counterfactuals over agent k's REAL policy from
+                            # the step that actually produced prev_joint_action.
+                            marginal_probs = jnp.einsum("ea,ajet->jet", prev_action_probs[k], cf_probs)
+                            kl_per_j = _safe_kl_lstm(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
+                            kl_list.append(kl_per_j)
+
+                            if value_influence_mode is not None:
+                                # Same marginalization, applied to the value instead of
+                                # the action distribution: "what would agent j's value
+                                # have been on average, had agent k's action been drawn
+                                # from k's own real policy instead of the specific
+                                # action it actually took." Comparing that to the REAL
+                                # value (which used k's actual action) gives delta_v,
+                                # the welfare-aware-influence paper's full ΔV term --
+                                # positive when this specific action helped j relative
+                                # to k's own typical behavior, negative when it hurt,
+                                # scaled by how MUCH it helped/hurt (not just the sign).
+                                # delta_v_list[k][j] = delta_v_(k->j): how much k's real
+                                # action changed j's value relative to k's own average
+                                # behavior.
+                                marginal_value = jnp.einsum("ea,aje->je", prev_action_probs[k], cf_values)  # (j, e)
+                                delta_v_list.append(real_value - marginal_value)  # (j, e)
+
+                        kl_stack = jnp.stack(kl_list, axis=0)  # (k, j, NUM_ENVS)
+                        if value_influence_mode is None:
+                            combined = kl_stack
+                        else:
+                            delta_v_stack = jnp.stack(delta_v_list, axis=0)  # (k, j, NUM_ENVS)
+                            if value_influence_mode == "mult":
+                                # r^WAI = I * ΔV: multiplying kl_per_j (the KL-based
+                                # influence magnitude I) by delta_v directly reproduces
+                                # that product -- using jnp.sign(delta_v) here instead
+                                # would collapse ΔV's magnitude to +-1, discarding
+                                # exactly the "how much" information the product is
+                                # meant to carry.
+                                combined = kl_stack * delta_v_stack
+                                value_term = delta_v_stack
+                            elif value_influence_mode == "sum":
+                                combined = kl_stack + value_influence_lambda * delta_v_stack
+                                value_term = delta_v_stack
+                            elif value_influence_mode == "value":
+                                # r = ΔV alone -- no KL-influence term I at all, unlike
+                                # "sum"/"mult" which both fold I in.
+                                combined = delta_v_stack
+                                value_term = delta_v_stack
+                            else:
+                                # diff / diff2 / value_diff all need the net (reciprocal)
+                                # delta_v: delta_v_(k->j) minus delta_v_(j->k) -- how much
+                                # k influenced j's value, net of how much j influenced k's
+                                # value back. delta_v_stack[j, k] (transpose's [k, j]
+                                # entry) is exactly delta_v_(j->k), computed during
+                                # iteration j above.
+                                reverse = jnp.transpose(delta_v_stack, (1, 0, 2))
+                                net_delta_v = delta_v_stack - reverse
+                                if value_influence_mode == "diff":
+                                    combined = kl_stack + value_influence_lambda * net_delta_v
+                                elif value_influence_mode == "diff2":
+                                    combined = kl_stack * net_delta_v
+                                else:  # "value_diff": net delta_v alone, no I
+                                    combined = net_delta_v
+                                value_term = net_delta_v
+
+                            # Raw, un-scaled per-agent breakdown of the two signals that
+                            # go into `combined` above -- "just I", "just the value term"
+                            # (delta_v for mult/sum, net delta_v for diff/diff2), and
+                            # their raw product (only actually equal to `combined` for
+                            # "mult", but logged for every mode as a diagnostic) -- summed
+                            # over j != k the same way `influence` is below, but BEFORE
+                            # beta/lambda/done-masking, so these read the underlying
+                            # signal magnitudes directly instead of the applied reward.
+                            not_self_mat_kv = jnp.array(
+                                [[j != k for j in range(env.num_agents)] for k in range(env.num_agents)]
+                            )  # (k, j)
+                            influence_kl_component = jnp.sum(
+                                jnp.where(not_self_mat_kv[:, :, None], kl_stack, 0.0), axis=1
+                            )  # (k, NUM_ENVS)
+                            influence_value_component = jnp.sum(
+                                jnp.where(not_self_mat_kv[:, :, None], value_term, 0.0), axis=1
+                            )
+                            influence_kl_times_value_component = jnp.sum(
+                                jnp.where(not_self_mat_kv[:, :, None], kl_stack * value_term, 0.0), axis=1
+                            )
+
+                        influence = []
+                        for k in range(env.num_agents):
+                            not_self = jnp.array([j != k for j in range(env.num_agents)])
+                            influence.append(jnp.sum(jnp.where(not_self[:, None], combined[k], 0.0), axis=0))
+
+                        influence = jnp.stack(influence, axis=0)  # (num_agents=k, NUM_ENVS)
+
+                        # NORMAL vs LSTM (Normal's MOA-free counterpart lives in the
+                        # `elif influence_reward:` branch further down, after env.step):
+                        # both compute the same Jaques et al. causal-influence KL, but they
+                        # get the real/counterfactual quantities completely differently.
+                        #
+                        #  - cond_probs: Normal recomputes this by calling the network on
+                        #    the REAL obs that resulted from env.step -- i.e. it waits for
+                        #    the environment to tell it what happened. LSTM just reuses
+                        #    pi_list[j], already computed above during action selection,
+                        #    because the policy already conditioned on the real previous
+                        #    joint action as an input -- nothing new needs to be asked of
+                        #    the environment.
+                        #
+                        #  - counterfactual generation (_cf_probs vs Normal's _cf_obs):
+                        #    Normal's _cf_obs calls jax.vmap(env.step) with the SAME
+                        #    rng_step/env_state_t but agent k's action swapped -- a real
+                        #    resimulation of physics. LSTM's _cf_probs never touches the
+                        #    environment: it swaps agent k's slot in
+                        #    prev_joint_action_onehot and re-calls the SAME network with the
+                        #    SAME obs/carry. The "counterfactual" here is a hypothetical
+                        #    belief fed to the policy, not a hypothetical physical outcome.
+                        #
+                        #  - marginal_probs einsum weight: Normal weights by
+                        #    pi_list[k].probs (k's policy at THIS timestep, matching
+                        #    cond_probs which is anchored to this timestep's real obs).
+                        #    LSTM weights by prev_action_probs[k] (k's policy from the
+                        #    PREVIOUS timestep, matching cond_probs which is anchored to the
+                        #    previous action). This keeps both sides of the KL referring to
+                        #    the same moment in time.
+                        #
+                        #  - beta uses rew_shaping_anneal(current_timestep) here
+                        #    (curriculum-gated) -- Normal's `elif influence_reward:` branch
+                        #    further down computes current_timestep the same way but never
+                        #    multiplies beta by the anneal schedule. That asymmetry is a
+                        #    pre-existing inconsistency in the file, not an intentional
+                        #    design choice; if fixing it, apply the same
+                        #    `* rew_shaping_anneal(current_timestep)` there too.
+                        #
+                        #  - cost: Normal pays action_dim extra env.step calls PER agent k,
+                        #    per timestep -- expensive but exact. LSTM pays action_dim extra
+                        #    network forward passes per agent k -- much cheaper, but the
+                        #    resulting "influence" is always one step stale relative to the
+                        #    action that produced it (see cond_probs note above).
+                    elif influence_reward and value_influence_use_qnet:
+                        # mult_sep/sum_sep/diff_sep/diff2_sep -- FOUR SEPARATE, self-
+                        # contained implementations of the mult/sum/diff/diff2 formulas
+                        # above. Deliberately not sharing any code with that block: the
+                        # KL-divergence/counterfactual-policy computation below is
+                        # rederived from scratch here rather than calling into
+                        # _safe_kl_lstm/_apply_pi_value above, so nothing about the
+                        # non-sep modes is touched by this branch. The four modes DO
+                        # share this setup with EACH OTHER (only the final combine
+                        # formula differs between them, same as the non-sep block does
+                        # for its six modes) -- that's new code shared among new code,
+                        # not reuse of the existing implementation.
+                        cond_probs = jnp.stack(
+                            [pi_list[j].probs for j in range(env.num_agents)], axis=0
+                        )  # (j, e, t) -- REAL
+
+                        current_timestep = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
+                        beta = config["INFLUENCE_WEIGHT"] * rew_shaping_anneal(current_timestep)
+
+                        def _safe_kl_lstm_sep(cond_probs, marginal_probs):
+                            eps = 1e-6
+                            cond_safe = cond_probs + eps
+                            cond_safe = cond_safe / cond_safe.sum(-1, keepdims=True)
+                            marginal_safe = marginal_probs + eps
+                            marginal_safe = marginal_safe / marginal_safe.sum(-1, keepdims=True)
+                            return distrax.Categorical(probs=cond_safe).kl_divergence(
+                                distrax.Categorical(probs=marginal_safe)
+                            )
+
+                        def _cf_pi_probs_sep(j, other_action_onehot):
+                            # Policy-only counterfactual (no value head reused here --
+                            # qnet supplies delta_v separately below).
+                            _, (pi_j, _) = network[j].apply(
+                                train_state[j].params, policy_hstate[j], obs_batch[j], other_action_onehot
+                            )
+                            return pi_j.probs
+
+                        # THIS step's real joint action (not prev_joint_action_onehot,
+                        # which conditions the POLICY) -- qnet estimates Q(s,a) for the
+                        # CURRENT decision, so it needs the action actually taken now.
+                        joint_action_onehot_current = jax.nn.one_hot(
+                            jnp.stack(env_act, axis=-1), action_dim
+                        )  # (NUM_ENVS, num_agents, action_dim)
+
+                        # REAL Q-value for every agent under the REAL current joint
+                        # action, via the FROZEN target network -- this is also the
+                        # carry-updating call, so its returned carries become
+                        # new_qnet_hstate (threaded forward below, after env.step,
+                        # exactly like new_policy_hstate).
+                        real_qvalue = []
+                        new_qnet_hstate = []
+                        for j in range(env.num_agents):
+                            new_qh_j, real_qv_j = qnet[j].apply(
+                                qnet_train_state[j].target_network_params, qnet_hstate[j],
+                                obs_batch[j], joint_action_onehot_current,
+                            )
+                            real_qvalue.append(real_qv_j)
+                            new_qnet_hstate.append(new_qh_j)
+                        real_qvalue = jnp.stack(real_qvalue, axis=0)  # (j, e)
+
+                        kl_list = []
+                        delta_v_list = []
+                        for k in range(env.num_agents):
+                            # KL term I: counterfactual over agent k's PREVIOUS action
+                            # (matches the policy's own conditioning), via
+                            # ActorCriticLSTM -- counterfactual carry discarded, only
+                            # the value (probs) is used.
+                            def _cf_probs_sep(a_idx, k=k):
+                                cf_onehot = jax.nn.one_hot(a_idx, action_dim)
+                                cf_joint = prev_joint_action_onehot.at[:, k, :].set(cf_onehot)
+                                return jnp.stack(
+                                    [_cf_pi_probs_sep(j, cf_joint) for j in range(env.num_agents)],
+                                    axis=0,
+                                )  # (j, e, t)
+
+                            cf_probs = jax.vmap(_cf_probs_sep)(jnp.arange(action_dim))  # (a, j, e, t)
+                            marginal_probs = jnp.einsum("ea,ajet->jet", prev_action_probs[k], cf_probs)
+                            kl_per_j = _safe_kl_lstm_sep(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
+                            kl_list.append(kl_per_j)
+
+                            # delta_v term: counterfactual over agent k's CURRENT
+                            # action, via qnet's FROZEN target network, marginalized by
+                            # k's CURRENT real policy (Q(s,a) is about the current
+                            # decision, unlike the KL term above).
+                            def _cf_qvalue_sep(a_idx, k=k):
+                                cf_onehot = jax.nn.one_hot(a_idx, action_dim)
+                                cf_joint = joint_action_onehot_current.at[:, k, :].set(cf_onehot)
+                                return jnp.stack(
+                                    [
+                                        qnet[j].apply(
+                                            qnet_train_state[j].target_network_params, qnet_hstate[j],
+                                            obs_batch[j], cf_joint,
+                                        )[1]
+                                        for j in range(env.num_agents)
+                                    ],
+                                    axis=0,
+                                )  # (j, e)
+
+                            cf_qvalue = jax.vmap(_cf_qvalue_sep)(jnp.arange(action_dim))  # (a, j, e)
+                            marginal_value = jnp.einsum("ea,aje->je", pi_list[k].probs, cf_qvalue)  # (j, e)
+                            # delta_v_(k->j): how much k's real action changed j's qnet
+                            # value relative to k's own average behavior.
+                            delta_v_list.append(real_qvalue - marginal_value)  # (j, e)
+
+                        kl_stack = jnp.stack(kl_list, axis=0)  # (k, j, NUM_ENVS)
+                        delta_v_stack = jnp.stack(delta_v_list, axis=0)  # (k, j, NUM_ENVS)
+
+                        if value_influence_mode == "mult_sep":
+                            # r = I * delta_v
+                            combined = kl_stack * delta_v_stack
+                            value_term = delta_v_stack
+                        elif value_influence_mode == "sum_sep":
+                            # r = I + lambda*delta_v
+                            combined = kl_stack + value_influence_lambda * delta_v_stack
+                            value_term = delta_v_stack
+                        else:
+                            # diff_sep/diff2_sep need the net (reciprocal) delta_v:
+                            # delta_v_(k->j) minus delta_v_(j->k).
+                            reverse = jnp.transpose(delta_v_stack, (1, 0, 2))
+                            net_delta_v = delta_v_stack - reverse
+                            if value_influence_mode == "diff_sep":
+                                combined = kl_stack + value_influence_lambda * net_delta_v
+                            else:  # "diff2_sep"
+                                combined = kl_stack * net_delta_v
+                            value_term = net_delta_v
+
+                        # Raw per-agent breakdown -- same convention/naming as the
+                        # non-sep block, so agent{i}/influence_kl etc. graphs work
+                        # identically for _sep runs.
+                        not_self_mat_sep = jnp.array(
+                            [[j != k for j in range(env.num_agents)] for k in range(env.num_agents)]
+                        )  # (k, j)
+                        influence_kl_component = jnp.sum(
+                            jnp.where(not_self_mat_sep[:, :, None], kl_stack, 0.0), axis=1
+                        )
+                        influence_value_component = jnp.sum(
+                            jnp.where(not_self_mat_sep[:, :, None], value_term, 0.0), axis=1
+                        )
+                        influence_kl_times_value_component = jnp.sum(
+                            jnp.where(not_self_mat_sep[:, :, None], kl_stack * value_term, 0.0), axis=1
                         )
 
-                    def _apply_pi_probs(j, other_action_onehot):
-                        _, (pi_j, _) = network[j].apply(
-                            train_state[j].params, policy_hstate[j], obs_batch[j], other_action_onehot
-                        )
-                        return pi_j.probs
-
-                    influence = []
-                    for k in range(env.num_agents):
-                        def _cf_probs(a_idx, k=k):
-                            cf_onehot = jax.nn.one_hot(a_idx, action_dim)
-                            cf_joint = prev_joint_action_onehot.at[:, k, :].set(cf_onehot)
-                            return jnp.stack(
-                                [_apply_pi_probs(j, cf_joint) for j in range(env.num_agents)], axis=0
-                            )  # (j, e, t)
-
-                        cf_probs = jax.vmap(_cf_probs)(jnp.arange(action_dim))  # (a, j, e, t)
-                        # Marginalize the counterfactuals over agent k's REAL policy from
-                        # the step that actually produced prev_joint_action.
-                        marginal_probs = jnp.einsum("ea,ajet->jet", prev_action_probs[k], cf_probs)
-                        kl_per_j = _safe_kl_lstm(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
-
-                        not_self = jnp.array([j != k for j in range(env.num_agents)])
-                        influence.append(jnp.sum(jnp.where(not_self[:, None], kl_per_j, 0.0), axis=0))
-
-                    influence = jnp.stack(influence, axis=0)  # (num_agents=k, NUM_ENVS)
-
-                    # NORMAL vs LSTM (Normal's MOA-free counterpart lives in the
-                    # `elif influence_reward:` branch further down, after env.step):
-                    # both compute the same Jaques et al. causal-influence KL, but they
-                    # get the real/counterfactual quantities completely differently.
-                    #
-                    #  - cond_probs: Normal recomputes this by calling the network on
-                    #    the REAL obs that resulted from env.step -- i.e. it waits for
-                    #    the environment to tell it what happened. LSTM just reuses
-                    #    pi_list[j], already computed above during action selection,
-                    #    because the policy already conditioned on the real previous
-                    #    joint action as an input -- nothing new needs to be asked of
-                    #    the environment.
-                    #
-                    #  - counterfactual generation (_cf_probs vs Normal's _cf_obs):
-                    #    Normal's _cf_obs calls jax.vmap(env.step) with the SAME
-                    #    rng_step/env_state_t but agent k's action swapped -- a real
-                    #    resimulation of physics. LSTM's _cf_probs never touches the
-                    #    environment: it swaps agent k's slot in
-                    #    prev_joint_action_onehot and re-calls the SAME network with the
-                    #    SAME obs/carry. The "counterfactual" here is a hypothetical
-                    #    belief fed to the policy, not a hypothetical physical outcome.
-                    #
-                    #  - marginal_probs einsum weight: Normal weights by
-                    #    pi_list[k].probs (k's policy at THIS timestep, matching
-                    #    cond_probs which is anchored to this timestep's real obs).
-                    #    LSTM weights by prev_action_probs[k] (k's policy from the
-                    #    PREVIOUS timestep, matching cond_probs which is anchored to the
-                    #    previous action). This keeps both sides of the KL referring to
-                    #    the same moment in time.
-                    #
-                    #  - beta uses rew_shaping_anneal(current_timestep) here
-                    #    (curriculum-gated) -- Normal's `elif influence_reward:` branch
-                    #    further down computes current_timestep the same way but never
-                    #    multiplies beta by the anneal schedule. That asymmetry is a
-                    #    pre-existing inconsistency in the file, not an intentional
-                    #    design choice; if fixing it, apply the same
-                    #    `* rew_shaping_anneal(current_timestep)` there too.
-                    #
-                    #  - cost: Normal pays action_dim extra env.step calls PER agent k,
-                    #    per timestep -- expensive but exact. LSTM pays action_dim extra
-                    #    network forward passes per agent k -- much cheaper, but the
-                    #    resulting "influence" is always one step stale relative to the
-                    #    action that produced it (see cond_probs note above).
+                        influence = []
+                        for k in range(env.num_agents):
+                            not_self = jnp.array([j != k for j in range(env.num_agents)])
+                            influence.append(jnp.sum(jnp.where(not_self[:, None], combined[k], 0.0), axis=0))
+                        influence = jnp.stack(influence, axis=0)  # (num_agents=k, NUM_ENVS)
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -491,6 +990,52 @@ def make_train(config):
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state_t, env_act)
+
+                # The one genuinely pre-shaping snapshot in this function -- every
+                # branch below (VALUE_INEQUITY_AVERSION's subtraction, then whichever
+                # influence-reward mechanism runs) mutates `reward` in place from here
+                # on. Persisted into every branch's info/info_i below as
+                # "extrinsic_reward" for live behavioral-metrics logging (P ratio uses
+                # eat_own/eat_other directly and doesn't need this, but the
+                # influence/delta_v-vs-extrinsic-reward correlation metric does, and
+                # must never be computed against the shaped reward -- that would
+                # trivially inflate the correlation since the shaped reward already
+                # contains a scaled copy of the influence/delta_v signal).
+                raw_env_reward = reward  # (NUM_ENVS, num_agents)
+
+                if value_inequity_aversion:
+                    # u_k = r_k - [alpha * sum_{j!=k} max(V_j - V_k, 0)
+                    #            + beta  * sum_{j!=k} max(V_k - V_j, 0)] / (N - 1)
+                    # Same shape as get_inequity_aversion_rewards_immediate() in
+                    # coin_game.py, but built from the PRE-STEP value estimates
+                    # (`value`, already computed above during action selection) rather
+                    # than the immediate reward -- V_k is a standing critic estimate of
+                    # agent k's expected return, so this penalizes an agent for being
+                    # ahead/behind in expected long-run outcome, not just this step's
+                    # payoff.
+                    if config["PARAMETER_SHARING"]:
+                        value_stack = value.reshape(env.num_agents, config["NUM_ENVS"])
+                    else:
+                        value_stack = jnp.stack(value, axis=0)  # (num_agents, NUM_ENVS)
+                    v_k = value_stack[:, None, :]  # (k, 1, NUM_ENVS)
+                    v_j = value_stack[None, :, :]  # (1, j, NUM_ENVS)
+                    disadvantageous = jnp.maximum(v_j - v_k, 0.0)  # (k, j, NUM_ENVS)
+                    advantageous = jnp.maximum(v_k - v_j, 0.0)     # (k, j, NUM_ENVS)
+                    not_self = (1.0 - jnp.eye(env.num_agents))[:, :, None]
+                    n_others = env.num_agents - 1
+                    value_inequity_penalty = (
+                        value_inequity_alpha * jnp.sum(disadvantageous * not_self, axis=1)
+                        + value_inequity_beta * jnp.sum(advantageous * not_self, axis=1)
+                    ) / n_others  # (k=num_agents, NUM_ENVS)
+                    reward = reward - value_inequity_penalty.T  # (NUM_ENVS, num_agents)
+
+                # Snapshot reward right before any influence-reward shaping gets added
+                # below, so the actual per-agent bonus (whatever it turns out to be --
+                # constant beta, ANNEALED beta in the lstm_influence branch below, with
+                # or without a done-step mask) can be recovered afterwards as a measured
+                # `reward - reward_before_influence` delta instead of re-deriving each
+                # branch's exact formula/schedule here.
+                reward_before_influence = reward
 
                 if recurrent_moa:
                     done_env = done["__all__"]
@@ -507,15 +1052,30 @@ def make_train(config):
                     moa_hstate_next = [reset_hstate(h, done_env) for h in new_moa_hstate]
                 elif lstm_influence:
                     done_env = done["__all__"]
-                    influence = influence * (1.0 - done_env.astype(jnp.float32))[None, :]
-                    reward = reward + beta * influence.T
+                    # Policy-state resets always happen -- the architecture (carry,
+                    # previous-action input) exists regardless of whether an intrinsic
+                    # reward is being computed from it.
                     policy_hstate_next = [reset_hstate(h, done_env) for h in new_policy_hstate]
+                    if value_influence_use_qnet:
+                        # new_qnet_hstate is produced by whichever mult_sep/sum_sep/
+                        # diff_sep/diff2_sep block ran above, from its REAL (not
+                        # counterfactual) qnet forward call -- same reset convention
+                        # as policy_hstate_next.
+                        qnet_hstate_next = [reset_hstate(h, done_env) for h in new_qnet_hstate]
                     joint_action = jnp.stack(env_act, axis=-1)  # (NUM_ENVS, num_agents) -- THIS step's real action
                     # -1 (not 0) on reset -- see the sentinel comment at initialization.
                     prev_joint_action_next = jnp.where(done_env[:, None], -1, joint_action)
-                    prev_action_probs_next = jnp.where(
-                        done_env[None, :, None], jnp.full_like(cond_probs, 1.0 / action_dim), cond_probs
-                    )
+                    if influence_reward:
+                        influence = influence * (1.0 - done_env.astype(jnp.float32))[None, :]
+                        reward = reward + beta * influence.T
+                        prev_action_probs_next = jnp.where(
+                            done_env[None, :, None], jnp.full_like(cond_probs, 1.0 / action_dim), cond_probs
+                        )
+                    else:
+                        # Never read when influence_reward is off (it only feeds the
+                        # marginalization above) -- carry it through unchanged rather
+                        # than spend a jnp.where recomputing something unused.
+                        prev_action_probs_next = prev_action_probs
                     # NORMAL vs LSTM: the first two lines above (masking influence by
                     # done_env, adding it into reward) are IDENTICAL in spirit to
                     # Normal's `elif influence_reward:` branch further down -- don't
@@ -584,11 +1144,16 @@ def make_train(config):
 
                         # Real conditional: what agents actually do next, given the real
                         # joint action that was actually taken -- already have obsv for free.
+                        # cond_value (the REAL next-obs value estimate per agent) is only
+                        # used when value_influence_mode is set -- it's free from the same forward
+                        # pass that produces cond_probs.
                         obsv_flat = jnp.transpose(obsv, (1, 0, 2, 3, 4)).reshape(-1, *obs_shape)
-                        cond_pi, _ = network.apply(train_state.params, obsv_flat)
+                        cond_pi, cond_value = network.apply(train_state.params, obsv_flat)
                         cond_probs = cond_pi.probs.reshape(env.num_agents, config["NUM_ENVS"], action_dim)
+                        cond_value = cond_value.reshape(env.num_agents, config["NUM_ENVS"])
 
-                        influence = []
+                        kl_list = []
+                        delta_v_list = []  # only populated when value_influence_mode is not None
                         for k in range(env.num_agents):
                             def _cf_obs(a_idx, k=k):
                                 cf_act = [
@@ -604,32 +1169,89 @@ def make_train(config):
                             cf_obsv_flat = jnp.transpose(
                                 cf_obsv_all, (0, 2, 1, 3, 4, 5)
                             ).reshape(-1, *obs_shape)
-                            cf_pi, _ = network.apply(train_state.params, cf_obsv_flat)
+                            cf_pi, cf_value = network.apply(train_state.params, cf_obsv_flat)
                             cf_probs = cf_pi.probs.reshape(
                                 action_dim, env.num_agents, config["NUM_ENVS"], action_dim
                             )
+                            cf_value = cf_value.reshape(action_dim, env.num_agents, config["NUM_ENVS"])
 
                             # Marginalize the counterfactuals over agent k's own real policy.
                             marginal_probs = jnp.einsum("ea,ajet->jet", act_probs[k], cf_probs)
                             kl_per_j = _safe_kl(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
+                            kl_list.append(kl_per_j)
 
-                            influence.append(
-                                jnp.sum(jnp.where(not_self_mat[k][:, None], kl_per_j, 0.0), axis=0)
+                            if value_influence_mode is not None:
+                                # ΔV_(k->j) is how much agent j's value under k's REAL
+                                # action (cond_value, from the real resimulated next obs)
+                                # differs from what j's value would have been on average
+                                # had k's action been drawn from k's own real policy
+                                # instead (marginal_value) -- reusing the exact same
+                                # counterfactual observations/weights already computed
+                                # for marginal_probs above, just applied to the value
+                                # head instead of the policy head.
+                                marginal_value = jnp.einsum("ea,aje->je", act_probs[k], cf_value)  # (j, e)
+                                delta_v_list.append(cond_value - marginal_value)  # (j, e)
+
+                        kl_stack = jnp.stack(kl_list, axis=0)  # (k, j, NUM_ENVS)
+                        if value_influence_mode is None:
+                            combined = kl_stack
+                        else:
+                            delta_v_stack = jnp.stack(delta_v_list, axis=0)  # (k, j, NUM_ENVS)
+                            if value_influence_mode == "mult":
+                                # r^WAI = I * ΔV
+                                combined = kl_stack * delta_v_stack
+                                value_term = delta_v_stack
+                            elif value_influence_mode == "sum":
+                                combined = kl_stack + delta_v_stack
+                                value_term = delta_v_stack
+                            else:
+                                # delta_v_(k->j) minus delta_v_(j->k): how much k
+                                # influenced j's value, net of how much j influenced k's
+                                # value back.
+                                reverse = jnp.transpose(delta_v_stack, (1, 0, 2))
+                                net_delta_v = delta_v_stack - reverse
+                                combined = (
+                                    kl_stack + net_delta_v if value_influence_mode == "diff"
+                                    else kl_stack * net_delta_v  # "diff2"
+                                )
+                                value_term = net_delta_v
+
+                            # Raw per-agent breakdown -- see the matching comment in the
+                            # lstm_influence branch above.
+                            influence_kl_component = jnp.sum(
+                                jnp.where(not_self_mat[:, :, None], kl_stack, 0.0), axis=1
+                            )  # (k, NUM_ENVS)
+                            influence_value_component = jnp.sum(
+                                jnp.where(not_self_mat[:, :, None], value_term, 0.0), axis=1
                             )
+                            influence_kl_times_value_component = jnp.sum(
+                                jnp.where(not_self_mat[:, :, None], kl_stack * value_term, 0.0), axis=1
+                            )
+
+                        influence = [
+                            jnp.sum(jnp.where(not_self_mat[k][:, None], combined[k], 0.0), axis=0)
+                            for k in range(env.num_agents)
+                        ]
                     else:
                         # Same idea, but each agent j's conditional/counterfactual query
                         # goes through agent j's OWN network/params rather than one
                         # shared call -- that's literally agent j's real policy, so this
                         # is the exact (not approximated) model of every other agent.
+                        cond_out = [
+                            network[j].apply(train_state[j].params, obsv[:, j])
+                            for j in range(env.num_agents)
+                        ]
                         cond_probs = jnp.stack(
-                            [
-                                network[j].apply(train_state[j].params, obsv[:, j])[0].probs
-                                for j in range(env.num_agents)
-                            ],
-                            axis=0,
+                            [out[0].probs for out in cond_out], axis=0
                         )  # (num_agents, NUM_ENVS, action_dim)
+                        # cond_value (REAL next-obs value per agent) is only used when
+                        # value_influence_mode is set -- free from the same forward pass as cond_probs.
+                        cond_value = jnp.stack(
+                            [out[1] for out in cond_out], axis=0
+                        )  # (num_agents, NUM_ENVS)
 
-                        influence = []
+                        kl_list = []
+                        delta_v_list = []  # only populated when value_influence_mode is not None
                         for k in range(env.num_agents):
                             def _cf_obs(a_idx, k=k):
                                 cf_act = [
@@ -642,24 +1264,77 @@ def make_train(config):
                                 return cf_obsv  # (NUM_ENVS, num_agents, *obs_shape)
 
                             cf_obsv_all = jax.vmap(_cf_obs)(jnp.arange(action_dim))  # (a, NUM_ENVS, num_agents, *obs_shape)
+                            cf_out = [
+                                network[j].apply(
+                                    train_state[j].params,
+                                    cf_obsv_all[:, :, j].reshape(-1, *obs_shape),
+                                )
+                                for j in range(env.num_agents)
+                            ]
                             cf_probs = jnp.stack(
                                 [
-                                    network[j].apply(
-                                        train_state[j].params,
-                                        cf_obsv_all[:, :, j].reshape(-1, *obs_shape),
-                                    )[0].probs.reshape(action_dim, config["NUM_ENVS"], action_dim)
-                                    for j in range(env.num_agents)
+                                    out[0].probs.reshape(action_dim, config["NUM_ENVS"], action_dim)
+                                    for out in cf_out
                                 ],
                                 axis=1,
                             )  # (a, j, e, t)
+                            cf_value = jnp.stack(
+                                [out[1].reshape(action_dim, config["NUM_ENVS"]) for out in cf_out],
+                                axis=1,
+                            )  # (a, j, e)
 
                             # Marginalize the counterfactuals over agent k's own real policy.
                             marginal_probs = jnp.einsum("ea,ajet->jet", pi_list[k].probs, cf_probs)
                             kl_per_j = _safe_kl(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
+                            kl_list.append(kl_per_j)
 
-                            influence.append(
-                                jnp.sum(jnp.where(not_self_mat[k][:, None], kl_per_j, 0.0), axis=0)
+                            if value_influence_mode is not None:
+                                # Same ΔV_(k->j) as the PARAMETER_SHARING branch above,
+                                # just using each agent's OWN network for both the real
+                                # and counterfactual value estimates.
+                                marginal_value = jnp.einsum("ea,aje->je", pi_list[k].probs, cf_value)  # (j, e)
+                                delta_v_list.append(cond_value - marginal_value)  # (j, e)
+
+                        kl_stack = jnp.stack(kl_list, axis=0)  # (k, j, NUM_ENVS)
+                        if value_influence_mode is None:
+                            combined = kl_stack
+                        else:
+                            delta_v_stack = jnp.stack(delta_v_list, axis=0)  # (k, j, NUM_ENVS)
+                            if value_influence_mode == "mult":
+                                # r^WAI = I * ΔV
+                                combined = kl_stack * delta_v_stack
+                                value_term = delta_v_stack
+                            elif value_influence_mode == "sum":
+                                combined = kl_stack + delta_v_stack
+                                value_term = delta_v_stack
+                            else:
+                                # delta_v_(k->j) minus delta_v_(j->k): how much k
+                                # influenced j's value, net of how much j influenced k's
+                                # value back.
+                                reverse = jnp.transpose(delta_v_stack, (1, 0, 2))
+                                net_delta_v = delta_v_stack - reverse
+                                combined = (
+                                    kl_stack + net_delta_v if value_influence_mode == "diff"
+                                    else kl_stack * net_delta_v  # "diff2"
+                                )
+                                value_term = net_delta_v
+
+                            # Raw per-agent breakdown -- see the matching comment in the
+                            # lstm_influence branch above.
+                            influence_kl_component = jnp.sum(
+                                jnp.where(not_self_mat[:, :, None], kl_stack, 0.0), axis=1
+                            )  # (k, NUM_ENVS)
+                            influence_value_component = jnp.sum(
+                                jnp.where(not_self_mat[:, :, None], value_term, 0.0), axis=1
                             )
+                            influence_kl_times_value_component = jnp.sum(
+                                jnp.where(not_self_mat[:, :, None], kl_stack * value_term, 0.0), axis=1
+                            )
+
+                        influence = [
+                            jnp.sum(jnp.where(not_self_mat[k][:, None], combined[k], 0.0), axis=0)
+                            for k in range(env.num_agents)
+                        ]
 
                     influence = jnp.stack(influence, axis=0)  # (num_agents, NUM_ENVS)
 
@@ -673,11 +1348,28 @@ def make_train(config):
                 # shaped_reward = compute_grouped_rewards(reward)
                 # reward = jax.tree.map(lambda x,y: x*rew_shaping_anneal_org(current_timestep)+y*rew_shaping_anneal(current_timestep), reward, shaped_reward)
 
+                # The actual per-agent influence-reward bonus that ended up in `reward`
+                # this step, whatever branch/schedule/mask produced it above -- see the
+                # reward_before_influence comment. Always (NUM_ENVS, num_agents), unlike
+                # `influence` itself whose shape/orientation differs per branch.
+                influence_contribution = reward - reward_before_influence
 
                 if config["PARAMETER_SHARING"]:
                     info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                     if influence_reward and not recurrent_moa:
-                        info["influence_reward"] = influence.T.reshape(-1)
+                        info["influence_reward"] = influence_contribution.reshape(-1)
+                    if value_influence_mode is not None:
+                        # Raw (un-scaled, pre-beta/lambda) breakdown of the two signals
+                        # combined into influence_reward above -- lets you see "just I",
+                        # "just the value term" (delta_v for mult/sum, net delta_v for
+                        # diff/diff2), and their raw product separately, rather than only
+                        # the final applied reward.
+                        info["influence_kl"] = influence_kl_component.T.reshape(-1)
+                        info["influence_value"] = influence_value_component.T.reshape(-1)
+                        info["influence_kl_times_value"] = influence_kl_times_value_component.T.reshape(-1)
+                    if value_inequity_aversion:
+                        info["value_inequity_penalty"] = value_inequity_penalty.T.reshape(-1)
+                    info["extrinsic_reward"] = raw_env_reward.reshape(-1)
                     transition = Transition(
                         batchify_dict(done, env.agents, config["NUM_ACTORS"]).squeeze(),
                         action,
@@ -692,7 +1384,10 @@ def make_train(config):
                     done = [v for v in done.values()]
                     for i in range(env.num_agents):
                         info_i = {key: jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"]),1), value[:,i]) for key, value in info.items()}
-                        info_i["influence_reward"] = influence[:, i].reshape((config["NUM_ACTORS"], 1))
+                        info_i["influence_reward"] = influence_contribution[:, i].reshape((config["NUM_ACTORS"], 1))
+                        if value_inequity_aversion:
+                            info_i["value_inequity_penalty"] = value_inequity_penalty[i].reshape((config["NUM_ACTORS"], 1))
+                        info_i["extrinsic_reward"] = raw_env_reward[:, i].reshape((config["NUM_ACTORS"], 1))
                         transition.append(MOATransition(
                             done[i],
                             env_act[i],
@@ -710,7 +1405,23 @@ def make_train(config):
                     done = [v for v in done.values()]
                     for i in range(env.num_agents):
                         info_i = {key: jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"]),1), value[:,i]) for key, value in info.items()}
-                        info_i["influence_reward"] = influence[i].reshape((config["NUM_ACTORS"], 1))
+                        if influence_reward:
+                            info_i["influence_reward"] = influence_contribution[:, i].reshape((config["NUM_ACTORS"], 1))
+                        if value_influence_mode is not None:
+                            # Raw per-agent breakdown -- see the matching comment in the
+                            # PARAMETER_SHARING branch above.
+                            info_i["influence_kl"] = influence_kl_component[i].reshape((config["NUM_ACTORS"], 1))
+                            info_i["influence_value"] = influence_value_component[i].reshape((config["NUM_ACTORS"], 1))
+                            info_i["influence_kl_times_value"] = influence_kl_times_value_component[i].reshape((config["NUM_ACTORS"], 1))
+                        if value_inequity_aversion:
+                            info_i["value_inequity_penalty"] = value_inequity_penalty[i].reshape((config["NUM_ACTORS"], 1))
+                        info_i["extrinsic_reward"] = raw_env_reward[:, i].reshape((config["NUM_ACTORS"], 1))
+                        if value_influence_use_qnet:
+                            # The REAL (non-counterfactual) qnet forward value on
+                            # joint_action_onehot_current -- reused (not recomputed) as
+                            # the "value" side of the extrinsic-only GAE target computed
+                            # for qnet's own regression target in _update_step.
+                            info_i["qnet_value"] = real_qvalue[i].reshape((config["NUM_ACTORS"], 1))
                         transition.append(MOATransition(
                             done[i],
                             env_act[i],
@@ -747,7 +1458,16 @@ def make_train(config):
                     for i in range(env.num_agents):
                         info_i = {key: jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"]),1), value[:,i]) for key, value in info.items()}
                         if influence_reward:
-                            info_i["influence_reward"] = influence[i].reshape((config["NUM_ACTORS"], 1))
+                            info_i["influence_reward"] = influence_contribution[:, i].reshape((config["NUM_ACTORS"], 1))
+                        if value_influence_mode is not None:
+                            # Raw per-agent breakdown -- see the matching comment in the
+                            # PARAMETER_SHARING branch above.
+                            info_i["influence_kl"] = influence_kl_component[i].reshape((config["NUM_ACTORS"], 1))
+                            info_i["influence_value"] = influence_value_component[i].reshape((config["NUM_ACTORS"], 1))
+                            info_i["influence_kl_times_value"] = influence_kl_times_value_component[i].reshape((config["NUM_ACTORS"], 1))
+                        if value_inequity_aversion:
+                            info_i["value_inequity_penalty"] = value_inequity_penalty[i].reshape((config["NUM_ACTORS"], 1))
+                        info_i["extrinsic_reward"] = raw_env_reward[:, i].reshape((config["NUM_ACTORS"], 1))
                         transition.append(Transition(
                             done[i],
                             env_act[i],
@@ -766,7 +1486,10 @@ def make_train(config):
                     # prev_joint_action_next, prev_action_probs_next). This is what
                     # makes the memory persist correctly across the jax.lax.scan that
                     # drives _env_step across NUM_STEPS timesteps.
-                    runner_state = (train_state, env_state, obsv, policy_hstate_next, prev_joint_action_next, prev_action_probs_next, update_step, rng)
+                    if value_influence_use_qnet:
+                        runner_state = (train_state, env_state, obsv, policy_hstate_next, qnet_hstate_next, prev_joint_action_next, prev_action_probs_next, update_step, rng)
+                    else:
+                        runner_state = (train_state, env_state, obsv, policy_hstate_next, prev_joint_action_next, prev_action_probs_next, update_step, rng)
                 else:
                     runner_state = (train_state, env_state, obsv, update_step, rng)
                 return runner_state, transition
@@ -791,7 +1514,10 @@ def make_train(config):
             if recurrent_moa:
                 train_state, env_state, last_obs, policy_hstate, moa_hstate, update_step, rng = runner_state
             elif lstm_influence:
-                train_state, env_state, last_obs, policy_hstate, prev_joint_action, prev_action_probs, update_step, rng = runner_state
+                if value_influence_use_qnet:
+                    train_state, env_state, last_obs, policy_hstate, qnet_hstate, prev_joint_action, prev_action_probs, update_step, rng = runner_state
+                else:
+                    train_state, env_state, last_obs, policy_hstate, prev_joint_action, prev_action_probs, update_step, rng = runner_state
             else:
                 train_state, env_state, last_obs, update_step, rng = runner_state
             if config["PARAMETER_SHARING"]:
@@ -822,6 +1548,54 @@ def make_train(config):
                     )
                     last_val.append(last_val_i)
                 last_val = jnp.stack(last_val, axis=0)
+
+                if value_influence_use_qnet:
+                    # Terminal GAE bootstrap for qnet's OWN regression target (see the
+                    # extrinsic-only _calculate_gae calls below). There's no real
+                    # action at this boundary (the rollout just ended), so unlike the
+                    # mid-rollout delta_v counterfactual -- which holds every other
+                    # agent at their REAL taken action -- there's nothing to hold "the
+                    # others" fixed at here. Full expectation over the joint policy
+                    # instead: enumerate the static action_dim**num_agents joint-action
+                    # grid once (both fixed Python ints -- cheap, done once per update,
+                    # not per step), weight each combo by the product of each agent's
+                    # real policy probability, evaluate qnet at every combo. A separate
+                    # (not reused) forward pass through the policy here, so nothing
+                    # about the last_val computation above is touched.
+                    last_pi_probs = []
+                    for i in range(env.num_agents):
+                        _, (last_pi_i, _) = network[i].apply(
+                            train_state[i].params, policy_hstate[i], last_obs_batch[i], prev_joint_action_onehot
+                        )
+                        last_pi_probs.append(last_pi_i.probs)  # (NUM_ENVS, action_dim)
+
+                    joint_action_grid = jnp.array(
+                        list(itertools.product(range(action_dim), repeat=env.num_agents))
+                    )  # (action_dim**num_agents, num_agents)
+                    joint_action_grid_onehot = jax.nn.one_hot(joint_action_grid, action_dim)  # (A, num_agents, action_dim)
+
+                    # Weight of each joint-action combo under the current REAL joint
+                    # policy: product of each agent's probability of its assigned
+                    # action in that combo.
+                    combo_weights = jnp.ones((joint_action_grid.shape[0], config["NUM_ENVS"]))
+                    for a in range(env.num_agents):
+                        combo_weights = combo_weights * last_pi_probs[a][:, joint_action_grid[:, a]].T
+
+                    last_qnet_val = []
+                    for i in range(env.num_agents):
+                        def _q_at_combo(combo_onehot, i=i):
+                            combo_onehot_batched = jnp.broadcast_to(
+                                combo_onehot[None, :, :], (config["NUM_ENVS"], env.num_agents, action_dim)
+                            )
+                            _, qv = qnet[i].apply(
+                                qnet_train_state[i].target_network_params, qnet_hstate[i],
+                                last_obs_batch[i], combo_onehot_batched,
+                            )
+                            return qv  # (NUM_ENVS,)
+
+                        q_grid = jax.vmap(_q_at_combo)(joint_action_grid_onehot)  # (A, NUM_ENVS)
+                        last_qnet_val.append(jnp.sum(combo_weights * q_grid, axis=0))  # (NUM_ENVS,)
+                    last_qnet_val = jnp.stack(last_qnet_val, axis=0)  # (num_agents, NUM_ENVS)
             else:
                 last_obs_batch = jnp.transpose(last_obs,(1,0,2,3,4))
                 last_val = []
@@ -867,6 +1641,28 @@ def make_train(config):
                     targets.append(targets_i)
                 advantages = jnp.stack(advantages, axis=0)
                 targets = jnp.stack(targets, axis=0)
+
+            if value_influence_use_qnet:
+                # Independent, extrinsic-only GAE target for qnet's own regression --
+                # reuses the same _calculate_gae closure (it's generic over
+                # .done/.value/.reward) but with EXTRINSIC reward and qnet's OWN value
+                # estimates substituted in via ._replace(), and last_qnet_val (computed
+                # above, self-contained) as the bootstrap. Never touches the policy's
+                # own `targets` above or ActorCriticLSTM's value head -- this is the
+                # fix for the circularity the mentor's guidance was about: Q_j must
+                # never regress toward a return that already has delta_v folded in.
+                qnet_targets = []
+                for i in range(env.num_agents):
+                    _, qnet_targets_i = _calculate_gae(
+                        traj_batch[i]._replace(
+                            value=traj_batch[i].info["qnet_value"].squeeze(-1),
+                            reward=traj_batch[i].info["extrinsic_reward"].squeeze(-1),
+                        ),
+                        last_qnet_val[i],
+                    )
+                    qnet_targets.append(qnet_targets_i)
+                qnet_targets = jnp.stack(qnet_targets, axis=0)  # (num_agents, NUM_STEPS, NUM_ENVS)
+
             # UPDATE NETWORK
             def _update_epoch(update_state, unused, i):
                 def _update_minbatch(train_state, batch_info, network_used):
@@ -1210,6 +2006,10 @@ def make_train(config):
                     update_state_dict.append(update_state)
                     train_state[i] = update_state[0]
                     metric_i = traj_batch[i].info
+                    # The actual (post-shaping) reward this agent received isn't part
+                    # of `info` -- it's traj_batch[i].reward, a separate Transition
+                    # field -- so it never got logged to WandB on its own before.
+                    metric_i['reward'] = traj_batch[i].reward
                     metric_i['loss'] = loss_info[0]
                     if recurrent_moa:
                         # Surface the loss components that were being computed and
@@ -1227,42 +2027,516 @@ def make_train(config):
             def callback(metric):
                 wandb.log(metric)
 
+            def _flush_group_b_metrics(buffer, flush_update_step):
+                # Host-side numpy port of the Group B behavioral metrics (conditional
+                # cooperation, retaliation lag, forgiveness rate, influence/delta_v vs
+                # extrinsic-reward correlation) -- only ever called every
+                # metrics_window_updates updates (see the jax.lax.cond gate below), so
+                # the Python-level loops here (retaliation lag's forward search in
+                # particular isn't easily vectorized -- it needs early termination on
+                # the first retaliation or episode boundary) are an acceptable
+                # trade-off, not something that runs every step. Assumes 2 agents
+                # (Coin Game) -- "the partner" of agent i is agent 1-i; extending to
+                # more agents would need a real per-pair-of-agents redesign, since
+                # eat_other_coins doesn't distinguish WHICH other agent was harmed.
+                num_a = env.num_agents
+                num_envs = config["NUM_ENVS"]
+                T = metrics_window_updates * num_steps
+                own = np.asarray(buffer["own"]).reshape(T, num_a, num_envs)
+                other = np.asarray(buffer["other"]).reshape(T, num_a, num_envs)
+                extrinsic = np.asarray(buffer["extrinsic_reward"]).reshape(T, num_a, num_envs)
+                done_arr = np.asarray(buffer["done"]).reshape(T, num_envs)
+                has_kl = "influence_kl" in buffer
+                has_value = "influence_value" in buffer
+                # Present whenever ANY influence-reward mechanism is active, including
+                # "plain Jaques" (unsigned KL-only influence, no delta_v at all --
+                # value_influence_mode is None but influence_reward is still True) --
+                # the guide explicitly wants metric 6 to cover that case too, not just
+                # the value-based variants that also populate influence_kl/_value.
+                has_reward = "influence_reward" in buffer
+                infl_kl = np.asarray(buffer["influence_kl"]).reshape(T, num_a, num_envs) if has_kl else None
+                infl_value = np.asarray(buffer["influence_value"]).reshape(T, num_a, num_envs) if has_value else None
+                infl_reward = np.asarray(buffer["influence_reward"]).reshape(T, num_a, num_envs) if has_reward else None
+
+                window, n_bins, max_lag = 20, 5, 20
+                log_payload = {"update_step": int(flush_update_step)}
+
+                def episode_sums(values):
+                    sums = []
+                    for e in range(num_envs):
+                        running = 0.0
+                        for t in range(T):
+                            running += values[t, e]
+                            if done_arr[t, e]:
+                                sums.append(running)
+                                running = 0.0
+                    return np.array(sums)
+
+                for i in range(num_a):
+                    j = 1 - i
+                    own_i, other_i = own[:, i, :], other[:, i, :]
+                    own_j, other_j = own[:, j, :], other[:, j, :]
+
+                    # Metric 3: conditional cooperation -- partner's trailing
+                    # coop-rate (rolling window, via cumsum so this stays vectorized)
+                    # bucketed, then focal agent's coop rate within each bucket.
+                    bucket_sums = np.zeros(n_bins)
+                    bucket_counts = np.zeros(n_bins)
+                    bins = np.linspace(0, 1, n_bins + 1)
+                    for e in range(num_envs):
+                        own_cum = np.concatenate([[0.0], np.cumsum(own_j[:, e])])  # length T+1
+                        oth_cum = np.concatenate([[0.0], np.cumsum(other_j[:, e])])
+                        # own_cum[t] - own_cum[t-window] = trailing sum over the window
+                        # ending at t, for t in [window, T-1] -- matches
+                        # partner_rate[window:]'s (T-window)-length range exactly.
+                        o = own_cum[window:T] - own_cum[0:T - window]
+                        d = oth_cum[window:T] - oth_cum[0:T - window]
+                        denom = o + d
+                        partner_rate = np.full(T, np.nan)
+                        partner_rate[window:] = np.where(denom > 0, o / np.maximum(denom, 1e-8), np.nan)
+                        eating_events = (own_i[:, e] + other_i[:, e]) > 0
+                        valid = eating_events & ~np.isnan(partner_rate)
+                        if not valid.any():
+                            continue
+                        bucket_idx = np.clip(np.digitize(partner_rate[valid], bins) - 1, 0, n_bins - 1)
+                        focal_coop = (own_i[valid, e] > 0).astype(float)
+                        for b in range(n_bins):
+                            mask = bucket_idx == b
+                            if mask.any():
+                                bucket_sums[b] += focal_coop[mask].sum()
+                                bucket_counts[b] += mask.sum()
+                    for b in range(n_bins):
+                        if bucket_counts[b] > 0:
+                            log_payload[f"agent{i}/conditional_coop_bin{b}"] = bucket_sums[b] / bucket_counts[b]
+
+                    # Metrics 4-5: retaliation lag + forgiveness rate. other_i[t] = i
+                    # harmed the partner (retaliation); other_j[t] = i WAS harmed at
+                    # t. Censored (never-retaliated-within-max_lag) events are counted
+                    # separately, never dropped -- right-censoring, not zero.
+                    lags = []
+                    censored = 0
+                    for e in range(num_envs):
+                        oth_i_e, oth_j_e, d_e = other_i[:, e], other_j[:, e], done_arr[:, e]
+                        for t in range(T):
+                            if oth_j_e[t] > 0:
+                                retaliated = False
+                                end = min(T, t + 1 + max_lag)
+                                for t_prime in range(t + 1, end):
+                                    if d_e[t_prime - 1]:
+                                        break
+                                    if oth_i_e[t_prime] > 0:
+                                        lags.append(t_prime - t)
+                                        retaliated = True
+                                        break
+                                if not retaliated:
+                                    censored += 1
+                    total_harm_events = len(lags) + censored
+                    if total_harm_events > 0:
+                        log_payload[f"agent{i}/forgiveness_rate"] = censored / total_harm_events
+                    if lags:
+                        log_payload[f"agent{i}/retaliation_lag_mean"] = float(np.mean(lags))
+                        log_payload[f"agent{i}/retaliation_lag_median"] = float(np.median(lags))
+
+                    # Metric 6: influence/delta_v vs EXTRINSIC (never shaped) reward,
+                    # segmented into done-delimited episodes -- correlating against the
+                    # shaped reward would trivially inflate this, since it already
+                    # contains a scaled copy of the influence/delta_v signal.
+                    if has_kl or has_value or has_reward:
+                        reward_per_ep = episode_sums(extrinsic[:, i, :])
+                        for name, arr in (("kl", infl_kl), ("value", infl_value), ("reward", infl_reward)):
+                            if arr is None:
+                                continue
+                            infl_per_ep = episode_sums(arr[:, i, :])
+                            if (
+                                len(infl_per_ep) > 1
+                                and len(infl_per_ep) == len(reward_per_ep)
+                                and np.std(infl_per_ep) > 0
+                                and np.std(reward_per_ep) > 0
+                            ):
+                                rho, _ = spearmanr(infl_per_ep, reward_per_ep)
+                                r, _ = pearsonr(infl_per_ep, reward_per_ep)
+                                log_payload[f"agent{i}/influence_{name}_reward_corr_spearman"] = rho
+                                log_payload[f"agent{i}/influence_{name}_reward_corr_pearson"] = r
+
+                wandb.log(log_payload, step=int(flush_update_step))
+
             update_step = update_step + 1
-            metric = jax.tree.map(lambda x: x.mean(), metric)
+            num_agents = env.num_agents
+            num_steps = config["NUM_STEPS"]
+            num_inner_steps = config["ENV_KWARGS"]["num_inner_steps"]
+
+            def _scale_eat_keys(d):
+                # eat_own_coins/eat_other_coins average near-zero per step (coin
+                # pickup is a rare event) -- scaling by num_inner_steps turns that
+                # tiny per-step expectation into an expected count over an inner
+                # episode, which is what's actually being reported here.
+                for key in ("eat_own_coins", "eat_other_coins"):
+                    if key in d:
+                        d[key] = d[key] * num_inner_steps
+                return d
+
+            def _welfare_metrics(reward_means):
+                # reward_means: (num_agents,) mean reward this window, one entry per
+                # agent -- the same "reward by agent" values being logged below, so
+                # U/E are trivially consistent with them.
+                total = jnp.sum(reward_means)
+                diffs = jnp.abs(reward_means[:, None] - reward_means[None, :])
+                # Standard Gini coefficient (mean-absolute-difference form); abs()
+                # + eps on the denominator guards against a near-zero or negative
+                # total (early training / heavily-penalized windows) blowing this up
+                # to +-inf instead of just reporting a degenerate value.
+                gini = jnp.sum(diffs) / (2.0 * num_agents * jnp.abs(total) + 1e-8)
+                return {
+                    "Overall/U_utilitarian_reward": total,
+                    "Overall/E_equality": 1.0 - gini,
+                }
+
             if config["PARAMETER_SHARING"]:
+                # traj_batch.info's fields were flattened ENV-major a few hundred
+                # lines up in _env_step (plain `.reshape((NUM_ACTORS,))` on a
+                # (NUM_ENVS, num_agents) array: index = env_idx*num_agents +
+                # agent_idx). traj_batch.reward was flattened AGENT-major instead
+                # (via batchify(), which stacks per-agent slices before reshaping:
+                # index = agent_idx*NUM_ENVS + env_idx). Both conventions collapse
+                # to the same scalar under a full mean(), which is why this
+                # discrepancy never mattered before -- but recovering a per-agent
+                # breakdown means respecting whichever convention actually produced
+                # each field, not applying one blindly to both.
+                num_envs = config["NUM_ENVS"]
+                per_agent_info = {
+                    key: jnp.mean(
+                        value.reshape(num_steps, num_envs, num_agents), axis=(0, 1)
+                    )
+                    for key, value in traj_batch.info.items()
+                    if value.shape == (num_steps, config["NUM_ACTORS"])
+                }
+                reward_time = traj_batch.reward.reshape(num_steps, num_agents, num_envs)
+                reward_means = jnp.mean(reward_time, axis=(0, 2))  # (num_agents,)
+
+                metric = jax.tree.map(lambda x: x.mean(), traj_batch.info)
+                metric = _scale_eat_keys(metric)
                 metric["update_step"] = update_step
                 metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                # jax.debug.callback(callback, metric)
+
+                for i in range(num_agents):
+                    metric[f"agent{i}/reward"] = reward_means[i]
+                    for key, value in _scale_eat_keys(
+                        {k: v[i] for k, v in per_agent_info.items()}
+                    ).items():
+                        metric[f"agent{i}/{key}"] = value
+                    # P (own-coin ratio): fraction of this agent's coin pickups that
+                    # were its own, vs the other agent's -- the direct behavioral
+                    # signature of cooperation vs defection. _scale_eat_keys' constant
+                    # multiplier cancels out in a ratio, so raw per_agent_info is fine
+                    # here without going through it. Logged every update, so this same
+                    # scalar viewed as a wandb line chart already IS the "P(Own Coin)
+                    # trajectory over training" plot -- no separate computation needed.
+                    own_i = per_agent_info["eat_own_coins"][i]
+                    other_i = per_agent_info["eat_other_coins"][i]
+                    metric[f"agent{i}/P_own_coin_ratio"] = own_i / (own_i + other_i + 1e-8)
+
+                metric.update(_welfare_metrics(reward_means))
+                # reward_means is post-shaping: env reward, PLUS the influence-reward
+                # bonus actually added to `reward` (per_agent_info["influence_reward"]
+                # is that measured delta itself -- see influence_contribution above,
+                # already accounts for beta, any annealing, and any done-step masking),
+                # MINUS value_inequity_penalty (subtracted from `reward`, so it needs to
+                # be added back here). Both fall back to zero when their mechanism is
+                # disabled/absent, recovering pure env reward either way.
+                influence_means = per_agent_info.get(
+                    "influence_reward", jnp.zeros(num_agents)
+                )
+                value_inequity_penalty_means = per_agent_info.get(
+                    "value_inequity_penalty", jnp.zeros(num_agents)
+                )
+                metric["Overall/env_reward"] = jnp.sum(
+                    reward_means - influence_means + value_inequity_penalty_means
+                )
+                # Just the intrinsic/inequity-aversion component on its own (not netted
+                # against env reward like Overall/env_reward above) -- zero whenever
+                # VALUE_INEQUITY_AVERSION is disabled.
+                metric["Overall/value_inequity_penalty"] = jnp.sum(value_inequity_penalty_means)
+                # Sustainability: average within-window timestep at which each
+                # agent's reward was positive, averaged across agents -- higher
+                # means reward collection is more spread out/deferred rather than
+                # front-loaded. reward_time is agent-major, see the comment above.
+                time_idx = jnp.arange(num_steps, dtype=jnp.float32)[:, None, None]
+                positive = (reward_time > 0).astype(jnp.float32)
+                per_agent_s = jnp.sum(time_idx * positive, axis=(0, 2)) / jnp.maximum(
+                    jnp.sum(positive, axis=(0, 2)), 1.0
+                )
+                metric["Overall/S_sustainability"] = jnp.mean(per_agent_s)
             else:
-                for i in range(env.num_agents):
-                    metric[i]["update_step"] = update_step
-                    metric[i]["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-                metric = metric[0]
-                # jax.debug.callback(callback, metric)
-            metric["update_step"] = update_step
-            metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["eat_own_coins"] = metric["eat_own_coins"] * config["ENV_KWARGS"]["num_inner_steps"]
+                # Sustainability needs the raw per-timestep reward (before the
+                # per-agent mean below collapses the time axis away).
+                time_idx = jnp.arange(num_steps, dtype=jnp.float32)[:, None]
+                per_agent_s = []
+                for i in range(num_agents):
+                    positive = (traj_batch[i].reward > 0).astype(jnp.float32)
+                    per_agent_s.append(
+                        jnp.sum(time_idx * positive) / jnp.maximum(jnp.sum(positive), 1.0)
+                    )
+                sustainability = jnp.mean(jnp.stack(per_agent_s))
+
+                metric = jax.tree.map(lambda x: x.mean(), metric)
+                for i in range(num_agents):
+                    _scale_eat_keys(metric[i])
+                    # P (own-coin ratio) -- see the matching comment in the
+                    # PARAMETER_SHARING branch above. _scale_eat_keys' constant
+                    # multiplier already ran above but cancels out in a ratio regardless.
+                    own_i = metric[i]["eat_own_coins"]
+                    other_i = metric[i]["eat_other_coins"]
+                    metric[i]["P_own_coin_ratio"] = own_i / (own_i + other_i + 1e-8)
+
+                reward_means = jnp.stack([metric[i]["reward"] for i in range(num_agents)])
+                # Same env-vs-intrinsic split as the PARAMETER_SHARING branch above:
+                # metric[i]["reward"] is post-shaping, metric[i]["influence_reward"]
+                # (present only when influence reward is enabled) is the measured
+                # influence-reward bonus actually added to reward, and
+                # metric[i]["value_inequity_penalty"] (present only when
+                # VALUE_INEQUITY_AVERSION is enabled) was SUBTRACTED from reward, so it
+                # needs to be added back -- the two intrinsic/shaping components.
+                influence_means = jnp.stack([
+                    metric[i].get("influence_reward", jnp.array(0.0))
+                    for i in range(num_agents)
+                ])
+                value_inequity_penalty_means = jnp.stack([
+                    metric[i].get("value_inequity_penalty", jnp.array(0.0))
+                    for i in range(num_agents)
+                ])
+
+                merged = {}
+                for i in range(num_agents):
+                    for key, value in metric[i].items():
+                        merged[f"agent{i}/{key}"] = value
+                metric = merged
+                metric["update_step"] = update_step
+                metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
+                metric.update(_welfare_metrics(reward_means))
+                metric["Overall/env_reward"] = jnp.sum(
+                    reward_means - influence_means + value_inequity_penalty_means
+                )
+                metric["Overall/value_inequity_penalty"] = jnp.sum(value_inequity_penalty_means)
+                metric["Overall/S_sustainability"] = sustainability
+
+            if value_influence_use_qnet:
+                # Fill the qnet replay buffer with this update's (obs, joint_action,
+                # extrinsic-only target) sequences, then -- gated by can_sample, same
+                # "cheap write every step, expensive work only when ready" pattern as
+                # the Group B metrics flush below -- run a periodic learn phase and
+                # target-network sync. See QTimestep's docstring for why `target` here
+                # is qnet_targets (extrinsic-only, self-bootstrapped), never the
+                # policy's own `targets`.
+                qnet_obs = jnp.stack([traj_batch[i].obs for i in range(env.num_agents)], axis=2)
+                qnet_joint_action = jnp.stack([traj_batch[i].action for i in range(env.num_agents)], axis=-1)
+                qnet_joint_action_onehot = jax.nn.one_hot(qnet_joint_action, action_dim)
+                qnet_target_batch = jnp.transpose(qnet_targets, (1, 2, 0))  # (NUM_STEPS, NUM_ENVS, num_agents)
+                qnet_done_batch = traj_batch[0].done  # (NUM_STEPS, NUM_ENVS), synchronized across agents
+
+                q_timestep = QTimestep(
+                    obs=jnp.swapaxes(qnet_obs, 0, 1),                      # (NUM_ENVS, NUM_STEPS, num_agents, *obs_shape)
+                    joint_action_onehot=jnp.swapaxes(qnet_joint_action_onehot, 0, 1),
+                    target=jnp.swapaxes(qnet_target_batch, 0, 1),
+                    done=jnp.swapaxes(qnet_done_batch, 0, 1),
+                )
+                qnet_buffer_state = qnet_buffer.add(qnet_buffer_state, q_timestep)
+
+                qnet_burn_in = config.get("VALUE_INFLUENCE_BURN_IN", 4)
+
+                def _qnet_learn(carry):
+                    qnet_train_state, rng = carry
+                    rng, sample_rng = jax.random.split(rng)
+                    experience = qnet_buffer.sample(qnet_buffer_state, sample_rng).experience
+                    done_seq = experience.done  # (B, T)
+                    # reset_in[t] = done at t-1 (episode ended just before t) -- same
+                    # convention as the PPO replay scan's reset_in in _loss_fn above.
+                    reset_in = jnp.concatenate(
+                        [jnp.zeros_like(done_seq[:, :1]), done_seq[:, :-1]], axis=1
+                    ).astype(bool)  # (B, T)
+
+                    new_qnet_train_state = []
+                    losses = []
+                    qpreds = []
+                    for i in range(env.num_agents):
+                        obs_i = experience.obs[:, :, i]              # (B, T, *obs_shape)
+                        joint_action_onehot_seq = experience.joint_action_onehot  # (B, T, num_agents, action_dim) -- SAME joint action for every agent's Q
+                        target_i = experience.target[:, :, i]        # (B, T)
+
+                        def _loss_fn(params, i=i, obs_i=obs_i, joint_action_onehot_seq=joint_action_onehot_seq, target_i=target_i):
+                            batch_size = obs_i.shape[0]
+                            init_carry = ValueInfluenceEstimator.initialize_carry(batch_size, hidden_dim)
+
+                            def _step(carry, xs):
+                                obs_t, ja_t, reset_t = xs
+                                carry = reset_hstate(carry, reset_t)
+                                new_carry, q_t = qnet[i].apply(params, carry, obs_t, ja_t)
+                                return new_carry, q_t
+
+                            _, q_seq = jax.lax.scan(
+                                _step, init_carry,
+                                (
+                                    jnp.swapaxes(obs_i, 0, 1),
+                                    jnp.swapaxes(joint_action_onehot_seq, 0, 1),
+                                    jnp.swapaxes(reset_in, 0, 1),
+                                ),
+                            )
+                            q_seq = jnp.swapaxes(q_seq, 0, 1)  # (B, T)
+                            # Burn-in: the first qnet_burn_in steps of each sampled
+                            # chunk run forward (warming the carry from zero toward a
+                            # plausible mid-sequence state, R2D2-style) but don't
+                            # contribute to the loss -- most sampled chunks start
+                            # mid-episode, so a bare zero carry misrepresents the real
+                            # accumulated history at that point.
+                            sq_err = (q_seq - target_i) ** 2
+                            loss = jnp.mean(sq_err[:, qnet_burn_in:])
+                            return loss, q_seq[:, qnet_burn_in:].mean()
+
+                        (loss_i, qpred_i), grads_i = jax.value_and_grad(_loss_fn, has_aux=True)(
+                            qnet_train_state[i].params
+                        )
+                        new_qnet_train_state.append(qnet_train_state[i].apply_gradients(grads=grads_i))
+                        losses.append(loss_i)
+                        qpreds.append(qpred_i)
+
+                    return (new_qnet_train_state, rng), (jnp.stack(losses), jnp.stack(qpreds))
+
+                def _qnet_skip(carry):
+                    qnet_train_state, rng = carry
+                    return (qnet_train_state, rng), (jnp.zeros(env.num_agents), jnp.zeros(env.num_agents))
+
+                is_learn_time = qnet_buffer.can_sample(qnet_buffer_state)
+                rng, _qnet_rng = jax.random.split(rng)
+                (qnet_train_state, _qnet_rng), (qnet_losses, qnet_qpreds) = jax.lax.cond(
+                    is_learn_time, _qnet_learn, _qnet_skip, (qnet_train_state, _qnet_rng)
+                )
+
+                # Periodic hard/soft target sync -- the reward-facing copy
+                # (target_network_params, read in _env_step) only changes every
+                # VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL updates, regardless of how
+                # often the learn phase above actually fires.
+                target_update_interval = config.get("VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL", 10)
+                tau = config.get("VALUE_INFLUENCE_TAU", 1.0)
+                is_sync_time = (update_step % target_update_interval) == 0
+                qnet_train_state = [
+                    ts.replace(
+                        target_network_params=jax.lax.cond(
+                            is_sync_time,
+                            lambda ts=ts: optax.incremental_update(ts.params, ts.target_network_params, tau),
+                            lambda ts=ts: ts.target_network_params,
+                        )
+                    )
+                    for ts in qnet_train_state
+                ]
+
+                for i in range(num_agents):
+                    metric[f"agent{i}/qnet_loss"] = qnet_losses[i]
+                    metric[f"agent{i}/qnet_pred_mean"] = qnet_qpreds[i]
+
             jax.debug.callback(callback, metric)
 
+            # Write this update's raw per-timestep data into the Group B metrics
+            # buffer, then flush (host-side numpy) every metrics_window_updates
+            # updates. See _flush_group_b_metrics below for what actually gets
+            # computed -- this just maintains the rolling (K, NUM_STEPS, ...) buffer
+            # and gates the (comparatively expensive) flush to a periodic cadence,
+            # same "cheap write every step, expensive work only periodically" pattern
+            # already used for the Value-Influence target-network sync (Part 1 plan).
+            def _stack_field(key):
+                if config["PARAMETER_SHARING"]:
+                    return traj_batch.info[key].reshape(
+                        num_steps, config["NUM_ENVS"], num_agents
+                    ).transpose(0, 2, 1)
+                return jnp.stack(
+                    [traj_batch[i].info[key].squeeze(-1) for i in range(num_agents)],
+                    axis=1,
+                )  # (NUM_STEPS, num_agents, NUM_ENVS)
+
+            done_this = (
+                traj_batch.done.reshape(num_steps, config["NUM_ENVS"], num_agents)[:, :, 0]
+                if config["PARAMETER_SHARING"] else traj_batch[0].done
+            )  # episodes reset synchronously, see reset_hstate's docstring
+            write_idx = update_step % metrics_window_updates
+            metrics_buffer = dict(metrics_buffer)
+            metrics_buffer["own"] = metrics_buffer["own"].at[write_idx].set(_stack_field("eat_own_coins"))
+            metrics_buffer["other"] = metrics_buffer["other"].at[write_idx].set(_stack_field("eat_other_coins"))
+            metrics_buffer["extrinsic_reward"] = metrics_buffer["extrinsic_reward"].at[write_idx].set(_stack_field("extrinsic_reward"))
+            metrics_buffer["done"] = metrics_buffer["done"].at[write_idx].set(done_this)
+            if value_influence_mode is not None:
+                metrics_buffer["influence_kl"] = metrics_buffer["influence_kl"].at[write_idx].set(_stack_field("influence_kl"))
+                metrics_buffer["influence_value"] = metrics_buffer["influence_value"].at[write_idx].set(_stack_field("influence_value"))
+            if influence_reward:
+                metrics_buffer["influence_reward"] = metrics_buffer["influence_reward"].at[write_idx].set(_stack_field("influence_reward"))
+
+            is_flush_time = (update_step % metrics_window_updates) == (metrics_window_updates - 1)
+            jax.lax.cond(
+                is_flush_time,
+                lambda: jax.debug.callback(_flush_group_b_metrics, metrics_buffer, update_step),
+                lambda: None,
+            )
+
             if recurrent_moa:
-                runner_state = (train_state, env_state, last_obs, policy_hstate, moa_hstate, update_step, rng)
+                env_runner_state = (train_state, env_state, last_obs, policy_hstate, moa_hstate, update_step, rng)
             elif lstm_influence:
-                runner_state = (train_state, env_state, last_obs, policy_hstate, prev_joint_action, prev_action_probs, update_step, rng)
+                if value_influence_use_qnet:
+                    env_runner_state = (train_state, env_state, last_obs, policy_hstate, qnet_hstate, prev_joint_action, prev_action_probs, update_step, rng)
+                else:
+                    env_runner_state = (train_state, env_state, last_obs, policy_hstate, prev_joint_action, prev_action_probs, update_step, rng)
             else:
-                runner_state = (train_state, env_state, last_obs, update_step, rng)
+                env_runner_state = (train_state, env_state, last_obs, update_step, rng)
+            if value_influence_use_qnet:
+                runner_state = (env_runner_state, metrics_buffer, qnet_train_state, qnet_buffer_state)
+            else:
+                runner_state = (env_runner_state, metrics_buffer)
             return runner_state, metric
+
+        # Rolling raw-per-timestep buffer feeding the live Group B behavioral metrics
+        # (_flush_group_b_metrics below) -- separate from, and unrelated to, any
+        # training data structure. Always (num_agents, NUM_ENVS)-shaped per field
+        # regardless of PARAMETER_SHARING/independent/recurrent_moa/lstm_influence,
+        # since eat_own_coins/eat_other_coins/extrinsic_reward exist for every branch.
+        metrics_buffer = {
+            "own": jnp.zeros((metrics_window_updates, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])),
+            "other": jnp.zeros((metrics_window_updates, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])),
+            "extrinsic_reward": jnp.zeros((metrics_window_updates, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])),
+            "done": jnp.zeros((metrics_window_updates, config["NUM_STEPS"], config["NUM_ENVS"])),
+        }
+        if value_influence_mode is not None:
+            metrics_buffer["influence_kl"] = jnp.zeros((metrics_window_updates, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"]))
+            metrics_buffer["influence_value"] = jnp.zeros((metrics_window_updates, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"]))
+        if influence_reward:
+            metrics_buffer["influence_reward"] = jnp.zeros((metrics_window_updates, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"]))
 
         rng, _rng = jax.random.split(rng)
         if recurrent_moa:
-            runner_state = (train_state, env_state, obsv, policy_hstate, moa_hstate, 0, _rng)
+            env_runner_state = (train_state, env_state, obsv, policy_hstate, moa_hstate, 0, _rng)
         elif lstm_influence:
-            runner_state = (train_state, env_state, obsv, policy_hstate, prev_joint_action, prev_action_probs, 0, _rng)
+            if value_influence_use_qnet:
+                env_runner_state = (train_state, env_state, obsv, policy_hstate, qnet_hstate, prev_joint_action, prev_action_probs, 0, _rng)
+            else:
+                env_runner_state = (train_state, env_state, obsv, policy_hstate, prev_joint_action, prev_action_probs, 0, _rng)
         else:
-            runner_state = (train_state, env_state, obsv, 0, _rng)
+            env_runner_state = (train_state, env_state, obsv, 0, _rng)
+        if value_influence_use_qnet:
+            # qnet_train_state/qnet_buffer_state change once per _update_step (not
+            # once per _env_step, unlike everything in env_runner_state) -- kept as
+            # separate sibling elements of the outer scan carry rather than threaded
+            # through _env_step's inner scan, exactly like metrics_buffer above.
+            runner_state = (env_runner_state, metrics_buffer, qnet_train_state, qnet_buffer_state)
+        else:
+            runner_state = (env_runner_state, metrics_buffer)
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state, "metrics": metric}
+        # Unwrap back to the original flat env_runner_state shape
+        # (train_state, env_state, ..., update_step, rng) before returning --
+        # metrics_buffer/qnet_train_state/qnet_buffer_state only needed to exist for
+        # the jax.lax.scan carry above, not downstream. algorithms/IPPO/_runner.py is
+        # shared across every env file and indexes out["runner_state"][0] expecting
+        # train_state directly; keeping the nesting internal-only here means
+        # single_run()'s checkpoint-saving code needs no changes and other env files
+        # (which never gained this nesting) stay unaffected.
+        env_runner_state = runner_state[0]
+        return {"runner_state": env_runner_state, "metrics": metric}
 
     return train
 
