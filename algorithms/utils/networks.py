@@ -297,6 +297,78 @@ class ActorCriticLSTM(nn.Module):
         return (z, z)
 
 
+class ValueInfluenceEstimator(nn.Module):
+    """
+    Estimates Q_j(s, a) for the Value Influence intrinsic reward -- how much
+    agent i's action changes agent j's expected value, relative to a
+    counterfactual baseline where i's action is marginalized out.
+
+    Structurally mirrors ActorCriticLSTM's CNN -> FC -> FC -> LSTM trunk (the
+    paper's own setup mirrors the entire actor-critic architecture for its
+    target-function network, conv layers included), but:
+      - takes the FULL joint action (all agents' one-hot actions), not just
+        "the other agent's," since Q(s, a) needs the acting agent's own
+        action too
+      - has no actor head, only a scalar Q-value output
+      - is a COMPLETELY SEPARATE module: its own CNN, own FC layers, own
+        LSTM, own params. It must never share a Module instance (and
+        therefore never share params) with ActorCriticLSTM, or with any
+        other agent's ValueInfluenceEstimator, even though the layer shapes
+        match. This separation is what keeps the PPO policy loss's gradient
+        from ever reaching these weights -- it's only half of what target
+        stability needs, though: a replay buffer and a periodic/slow update
+        schedule (done at the training-loop level, not here) are what
+        actually stop the moving-target instability that separate params
+        alone don't fix.
+
+    The counterfactual baseline Q_{j|i}(s, a^{-i}) should NOT be computed by
+    zeroing agent i's one-hot slot -- that would feed the network an input it
+    never sees during training (every real training input has a valid
+    one-hot action in every slot). Instead, call this same instance once per
+    candidate action for agent i (looping over action_dim, the same pattern
+    used for the cf_obs/cf_probs marginalization behind delta_v elsewhere in
+    ippo_cnn_coins.py) and average the resulting Q-values weighted by agent
+    i's real policy probabilities.
+
+    Attributes:
+        num_agents: Total number of agents (sizes the flattened action input)
+        action_dim: Number of discrete actions
+        hidden_dim: LSTM hidden size
+        activation: Activation function name ("relu" or "tanh")
+    """
+    num_agents: int
+    action_dim: int
+    hidden_dim: int = 128
+    activation: str = "relu"
+
+    def setup(self):
+        self.cnn = CNN(self.activation)
+        self.fc1 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.fc2 = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))
+        self.lstm = nn.LSTMCell(features=self.hidden_dim)
+        self.q_out = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))
+
+    def _activation_fn(self, x):
+        return nn.relu(x) if self.activation == "relu" else nn.tanh(x)
+
+    def __call__(self, carry, obs, joint_action_onehot):
+        embedding = self.cnn(obs)
+        flat_joint_action = joint_action_onehot.reshape(*joint_action_onehot.shape[:-2], -1)
+        x = jnp.concatenate([embedding, flat_joint_action], axis=-1)
+        h = self._activation_fn(self.fc1(x))
+        h = self._activation_fn(self.fc2(h))
+        new_carry, h = self.lstm(carry, h)
+
+        q_value = jnp.squeeze(self.q_out(h), axis=-1)
+
+        return new_carry, q_value
+
+    @staticmethod
+    def initialize_carry(batch_size, hidden_dim):
+        z = jnp.zeros((batch_size, hidden_dim))
+        return (z, z)
+
+
 class Actor(nn.Module):
     """
     Standalone Actor network for MAPPO algorithm.
