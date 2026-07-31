@@ -1,0 +1,23 @@
+# @package _global_
+# Social-influence intrinsic reward (Jaques et al., 2019), feedforward MOA-free,
+# RECIPROCAL-INFLUENCE PRODUCT variant: r = I * (delta_v_(k->j) - delta_v_(j->k)) --
+# agent k's reward multiplies the KL-based influence magnitude I by the NET value
+# effect between k and j: how much k's real action changed j's value, minus how much
+# j's real action (from j's own counterfactual) changed k's value back. Same net
+# value-effect term as value_influence_diff.yaml, but multiplied by I instead of
+# added to it (mirrors how value_influence_mult.yaml relates to
+# value_influence_sum.yaml for the one-directional delta_v). Same independent-policy
+# counterfactual mechanism as enabled_independent.yaml (real env.step resimulation,
+# no LSTM, no MOA network).
+PARAMETER_SHARING: False
+INFLUENCE_REWARD: True
+VALUE_INFLUENCE_DIFF2: True
+INFLUENCE_WEIGHT: 0.224   # paper's Table 3 Cleanup-MOA value, starting point for tuning
+# Influence needs distinguishable per-agent rewards -- the shared/common-reward path
+# never reaches the branch that produces them. Set this directly here rather than
+# changing the file's default `reward` group, so non-influence runs are unaffected.
+ENV_KWARGS:
+  shared_rewards: False
+REWARD: individual
+WANDB_TAGS:
+  - VALUE_INFLUENCE_DIFF2

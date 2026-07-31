@@ -1,0 +1,26 @@
+# @package _global_
+# Same mechanism as enabled_lstm.yaml (ActorCriticLSTM, main policy/value pathway
+# conditions directly on the other agent's previous action, no auxiliary loss), but
+# the influence reward is r = I * delta_v_(k->j) -- agent k's reward multiplies the
+# KL-based influence magnitude I by the SINGLE (not net/reciprocal) value effect: how
+# much k's action changed j's value. See value_influence_mult.yaml for the
+# feedforward (non-LSTM) version of this same combination, and
+# value_influence_diff2_lstm.yaml for the net (delta_v_(k->j) - delta_v_(j->k)) form.
+PARAMETER_SHARING: False
+INFLUENCE_REWARD: True
+LSTM_INFLUENCE: True
+VALUE_INFLUENCE_MULT: True
+LSTM_HIDDEN_DIM: 128
+# NUM_MINIBATCHES must divide NUM_ENVS here (minibatching permutes the actor axis only,
+# keeping each minibatch's full time sequence intact for BPTT) -- NOT NUM_STEPS*NUM_ENVS
+# like the feedforward path. The base default of 500 is invalid once NUM_ENVS is small.
+NUM_MINIBATCHES: 8
+# Full backprop-through-time over NUM_STEPS sequential CNN+LSTM steps is memory-heavy;
+# start shorter than the feedforward path's default of 1000 and raise if it fits.
+NUM_STEPS: 256
+INFLUENCE_WEIGHT: 0.62
+ENV_KWARGS:
+  shared_rewards: False
+REWARD: individual
+WANDB_TAGS:
+  - VALUE_INFLUENCE_MULT_LSTM

@@ -1,0 +1,22 @@
+# @package _global_
+# Social-influence intrinsic reward (Jaques et al., 2019), feedforward MOA-free,
+# WELFARE-AWARE variant: r = I * delta_v -- the KL-based influence magnitude I is
+# multiplied by delta_v, how much agent k's REAL action raised or lowered agent j's
+# value relative to what k's own real policy would have produced on average. Same
+# independent-policy counterfactual mechanism as enabled_independent.yaml (real
+# env.step resimulation, no LSTM, no MOA network). Identical behavior to
+# enabled_signed.yaml -- this is just the canonical name alongside
+# value_influence_sum.yaml / value_influence_diff.yaml, the other two ways of
+# combining I and delta_v.
+PARAMETER_SHARING: False
+INFLUENCE_REWARD: True
+VALUE_INFLUENCE_MULT: True
+INFLUENCE_WEIGHT: 0.224   # paper's Table 3 Cleanup-MOA value, starting point for tuning
+# Influence needs distinguishable per-agent rewards -- the shared/common-reward path
+# never reaches the branch that produces them. Set this directly here rather than
+# changing the file's default `reward` group, so non-influence runs are unaffected.
+ENV_KWARGS:
+  shared_rewards: False
+REWARD: individual
+WANDB_TAGS:
+  - VALUE_INFLUENCE_MULT

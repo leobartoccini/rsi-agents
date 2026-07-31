@@ -1,0 +1,47 @@
+# @package _global_
+# Same formula as value_influence_diff_lstm.yaml (r = I + lambda*(delta_v_(k->j) -
+# delta_v_(j->k))), but delta_v comes from a fully SEPARATE Q-network
+# (ValueInfluenceEstimator -- own CNN/FC/LSTM, own optimizer, periodically-synced
+# frozen target copy) instead of ActorCriticLSTM's own value head. This breaks the
+# circularity the non-"_sep" modes have: there, the intrinsic reward is derived from
+# the exact critic PPO is simultaneously updating with that same reward. Here, the
+# reward-facing Q-estimator (a) never receives gradients from the PPO loss (gradient
+# isolation) and (b) only regresses toward EXTRINSIC reward via its own frozen target
+# network (never the shaped reward or ActorCriticLSTM's value head), synced into the
+# reward computation only every VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL updates
+# (target stability).
+PARAMETER_SHARING: False
+INFLUENCE_REWARD: True
+LSTM_INFLUENCE: True
+VALUE_INFLUENCE_DIFF_SEP: True
+LSTM_HIDDEN_DIM: 128
+
+# --- Q-estimator (qnet) hyperparameters ---
+VALUE_INFLUENCE_Q_LR: 0.0005
+VALUE_INFLUENCE_BUFFER_SEQ_LEN: 12
+VALUE_INFLUENCE_BURN_IN: 4
+VALUE_INFLUENCE_BUFFER_BATCH_SIZE: 32
+VALUE_INFLUENCE_BUFFER_PERIOD: 6
+VALUE_INFLUENCE_BUFFER_MIN_LENGTH: 48
+VALUE_INFLUENCE_BUFFER_MAX_SIZE: 200000
+VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL: 10
+VALUE_INFLUENCE_TAU: 1.0
+
+# Weight on the net delta_v term itself, independent of INFLUENCE_WEIGHT/beta (which
+# scales the WHOLE I + lambda*net_delta_v term once added to reward) -- override on
+# CLI, e.g. VALUE_INFLUENCE_LAMBDA=0.5.
+VALUE_INFLUENCE_LAMBDA: 1.0
+
+# NUM_MINIBATCHES must divide NUM_ENVS here (minibatching permutes the actor axis only,
+# keeping each minibatch's full time sequence intact for BPTT) -- NOT NUM_STEPS*NUM_ENVS
+# like the feedforward path. The base default of 500 is invalid once NUM_ENVS is small.
+NUM_MINIBATCHES: 8
+# Full backprop-through-time over NUM_STEPS sequential CNN+LSTM steps is memory-heavy;
+# start shorter than the feedforward path's default of 1000 and raise if it fits.
+NUM_STEPS: 256
+INFLUENCE_WEIGHT: 0.62
+ENV_KWARGS:
+  shared_rewards: False
+REWARD: individual
+WANDB_TAGS:
+  - VALUE_INFLUENCE_DIFF_LSTM_SEP
