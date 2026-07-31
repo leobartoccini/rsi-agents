@@ -961,14 +961,17 @@ class CoinGame(MultiAgentEnv):
                     rewards, disadvantageous, advantageous = self.get_inequity_aversion_rewards_immediate(new_smooth_rewards, state.inner_t, self.inequity_aversion_target_agents, self.inequity_aversion_alpha, self.inequity_aversion_beta)
                     state = state.replace(smooth_rewards=new_smooth_rewards)
                     info = {
-                    "original_rewards": rewards.squeeze(),
+                    # The pre-penalty payoff (captured above, before `rewards` was
+                    # reassigned to the shaped value) -- NOT `rewards.squeeze()`, which
+                    # would make this identical to shaped_rewards.
+                    "original_rewards": original_rewards.squeeze(),
                     "smooth_rewards": state.smooth_rewards.squeeze(),
                     "shaped_rewards": rewards.squeeze(),
                 }
                 else:
                     rewards, disadvantageous, advantageous = self.get_inequity_aversion_rewards_immediate(original_rewards, state.inner_t, self.inequity_aversion_target_agents, self.inequity_aversion_alpha, self.inequity_aversion_beta)
                     info = {
-                    "original_rewards": rewards.squeeze(),
+                    "original_rewards": original_rewards.squeeze(),
                     "shaped_rewards": rewards.squeeze(),
                 }
             elif self.svo:
@@ -1033,6 +1036,24 @@ class CoinGame(MultiAgentEnv):
             eat_own_coins = eat_own_coins.at[0, 0].set(red_reward[0])
             eat_own_coins = eat_own_coins.at[1, 0].set(green_reward[0])
             info["eat_own_coins"] = eat_own_coins.squeeze() * self.num_agents
+
+            # Same convention as eat_own_coins above, but for picking up the OTHER
+            # agent's coin (red picking a green coin / green picking a red coin) --
+            # red_green_matches/green_red_matches are exactly the events that earn
+            # red_penalty/green_penalty in the reward computation further up.
+            eat_other_coins = jnp.zeros((2, 1))
+            red_reward, green_reward = 0, 0
+            red_reward = jnp.where(
+                red_green_matches, red_reward + red_green_reward, red_reward
+            )
+
+            green_reward = jnp.where(
+                green_red_matches, green_reward + green_red_reward, green_reward
+            )
+
+            eat_other_coins = eat_other_coins.at[0, 0].set(red_reward[0])
+            eat_other_coins = eat_other_coins.at[1, 0].set(green_reward[0])
+            info["eat_other_coins"] = eat_other_coins.squeeze() * self.num_agents
 
             # if self.shared_rewards:
             #     rewards = jnp.zeros((2, 1))
