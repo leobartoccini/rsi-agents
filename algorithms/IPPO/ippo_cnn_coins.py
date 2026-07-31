@@ -49,6 +49,18 @@ def reset_hstate(carry, done_env):
     return (jnp.where(mask, 0.0, c), jnp.where(mask, 0.0, h))
 
 
+# TrainState subclass for the separate Value-Influence Q-network used by the
+# "_sep" reward modes. Holds two parameter sets:
+#   - params: the ONLINE network, updated every learn step via gradient descent
+#     on an extrinsic-only GAE target (see the qnet learn phase later in this
+#     file).
+#   - target_network_params: a FROZEN copy, synced from `params` only every
+#     VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL updates. The reward computation in
+#     _env_step always reads target_network_params, never params directly --
+#     this keeps the intrinsic reward signal from chasing a value function
+#     that is simultaneously being trained on a reward that already includes
+#     that signal (avoids circularity) and keeps the reward stable across
+#     updates (target-network trick, same idea as in DQN).
 class ValueInfluenceTrainState(TrainState):
     """TrainState for the Value-Influence Q-estimator (ValueInfluenceEstimator),
     carrying a frozen target_network_params alongside the trainable params -- mirrors
@@ -61,6 +73,10 @@ class ValueInfluenceTrainState(TrainState):
     target_network_params: Any
 
 
+# One (obs, joint_action, target, done) sample stored in the qnet's replay
+# buffer. `target` is the EXTRINSIC-only, self-bootstrapped GAE target computed
+# for the qnet's own regression (see the second _calculate_gae call later in
+# this file) -- never the policy's own (shaped-reward) GAE target.
 @chex.dataclass(frozen=True)
 class QTimestep:
     """One (obs, joint_action, target) sample for the Value-Influence Q-estimator's
@@ -151,6 +167,18 @@ def make_train(config):
     # is touched by this. LSTM_INFLUENCE-only, like VALUE/VALUE_DIFF -- the qnet
     # needs the same recurrent carry (qnet_hstate) threading LSTM_INFLUENCE already
     # sets up for the policy.
+    # ---------------------------------------------------------------------------
+    # VALUE-INFLUENCE REWARD MODES
+    # ---------------------------------------------------------------------------
+    # Six ways to turn delta_v (how much an agent's real action changed another
+    # agent's estimated value, relative to what its own real policy would have
+    # produced on average) into an intrinsic reward, optionally combined with the
+    # KL-based causal-influence magnitude I (Jaques et al.):
+    #   mult / sum / diff / diff2 / value / value_diff
+    # Each also has a "_sep" counterpart (mult_sep, sum_sep, diff_sep, diff2_sep)
+    # that computes delta_v from a fully separate ValueInfluenceEstimator Q-network
+    # instead of the policy's own value head -- see the qnet setup and _env_step
+    # branches below. At most one of these ten flags may be active at a time.
     value_influence_flags = {
         "mult": config.get("VALUE_INFLUENCE_MULT", False),
         "sum": config.get("VALUE_INFLUENCE_SUM", False),
@@ -174,6 +202,8 @@ def make_train(config):
             "(see config/influence/value_influence_*.yaml, value_lstm.yaml, "
             "value_diff_lstm.yaml)."
         )
+    # VALUE / VALUE_DIFF / all four *_SEP modes require LSTM_INFLUENCE=True --
+    # they are not implemented for the feedforward (env.step-resimulation) path.
     _sep_modes = ("mult_sep", "sum_sep", "diff_sep", "diff2_sep")
     if value_influence_flags["value"] or value_influence_flags["value_diff"] or any(
         value_influence_flags[m] for m in _sep_modes
@@ -242,6 +272,10 @@ def make_train(config):
         influence_reward = config.get("INFLUENCE_REWARD", False)
         recurrent_moa = config.get("RECURRENT_MOA", False)
         lstm_influence = config.get("LSTM_INFLUENCE", False)
+        # Resolve which single value-influence combination mode (if any) is active
+        # this run, from the ten mutually-exclusive config flags checked above.
+        # None means no value-influence term at all (plain KL-only influence reward,
+        # if INFLUENCE_REWARD is on).
         # Which welfare-aware combination (if any) to apply to the KL-based influence
         # magnitude I -- see the value_influence_flags assertion above for what each
         # mode means. None means plain (unsigned) influence reward, same as before
@@ -263,6 +297,10 @@ def make_train(config):
             ) if flag),
             None,
         )
+        # True only for the four "_sep" modes -- everything below gated on this flag
+        # (qnet instantiation, qnet_hstate, the replay buffer, the periodic learn
+        # phase) exists only when one of these four modes is active. In every other
+        # mode, delta_v comes from the policy's own value head instead.
         # mult_sep/sum_sep/diff_sep/diff2_sep use a fully separate Q-network
         # (ValueInfluenceEstimator) for delta_v instead of ActorCriticLSTM's value
         # head -- see the value_influence_flags comment above for why. Everything
@@ -361,6 +399,16 @@ def make_train(config):
                 tx=tx,
             ) for i in range(env.num_agents)]
 
+        # ---------------------------------------------------------------------------
+        # SEPARATE Q-NETWORK SETUP (only for mult_sep/sum_sep/diff_sep/diff2_sep)
+        # ---------------------------------------------------------------------------
+        # Builds one ValueInfluenceEstimator (a recurrent Q-network estimating
+        # Q_i(obs_i, joint_action) for agent i) per agent, with its own optimizer and
+        # its own ValueInfluenceTrainState (online + frozen target params). Also
+        # builds a flashbax trajectory replay buffer that stores contiguous sequences
+        # (not i.i.d. samples), since the qnet's LSTM carry must be genuinely unrolled
+        # across real consecutive timesteps. None of this shares any state, gradient,
+        # or optimizer with the main policy's train_state.
         if value_influence_use_qnet:
             # Fully separate Q-network for delta_v in the mult_sep/sum_sep/diff_sep/
             # diff2_sep modes -- own architecture, own params, own optimizer, never
@@ -369,11 +417,16 @@ def make_train(config):
             # VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL updates, see the learn phase in
             # _update_step) is ever read when computing the reward -- `.params` itself
             # is only touched by the periodic learn-phase gradient step.
+            # Own learning rate (defaults to the policy's LR) and own Adam optimizer chain
+            # -- gradients computed for the qnet never touch the policy's train_state.
             qnet_lr = config.get("VALUE_INFLUENCE_Q_LR", config["LR"])
             qnet_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(qnet_lr, eps=1e-5),
             )
+            # One independent ValueInfluenceEstimator per agent -- estimates agent i's
+            # expected return conditioned on the FULL joint action of all agents, not
+            # just its own action.
             qnet = [
                 ValueInfluenceEstimator(
                     num_agents=env.num_agents, action_dim=action_dim,
@@ -386,6 +439,8 @@ def make_train(config):
                 qnet[i].init(_rng, init_qh_1, init_x, init_joint_action)
                 for i in range(env.num_agents)
             ]
+            # target_network_params initialized equal to params; will only diverge once
+            # the periodic sync (later in this file) starts copying updated params into it.
             qnet_train_state = [
                 ValueInfluenceTrainState.create(
                     apply_fn=qnet[i].apply, params=p, target_network_params=p, tx=qnet_tx,
@@ -398,6 +453,10 @@ def make_train(config):
             # sampled chunk (with burn-in for chunks starting mid-episode, see the
             # learn phase in _update_step) instead of fed a cold zero-carry per
             # independent sample.
+            # Trajectory (not flat) replay buffer: stores overlapping sequences of length
+            # qnet_buffer_seq_len so the qnet's recurrent carry can be unrolled across a
+            # real chunk of consecutive timesteps during the learn phase, with burn-in for
+            # chunks that start mid-episode (see _qnet_learn later in this file).
             qnet_buffer_seq_len = config.get("VALUE_INFLUENCE_BUFFER_SEQ_LEN", 12)
             qnet_buffer = fbx.make_trajectory_buffer(
                 add_batch_size=config["NUM_ENVS"],
@@ -413,6 +472,8 @@ def make_train(config):
                 sample=jax.jit(qnet_buffer.sample),
                 can_sample=jax.jit(qnet_buffer.can_sample),
             )
+            # Shape-only placeholder used to pre-allocate the buffer's storage arrays --
+            # these values are never actually used.
             _dummy_qtimestep = QTimestep(
                 obs=jnp.zeros((env.num_agents, *(env.observation_space()[0]).shape)),
                 joint_action_onehot=jnp.zeros((env.num_agents, action_dim)),
@@ -649,6 +710,15 @@ def make_train(config):
                     influence = jnp.stack(influence, axis=-1)  # (NUM_ENVS, num_agents)
                 elif lstm_influence:
                     if influence_reward and not value_influence_use_qnet:
+                        # ---------------------------------------------------------------------------
+                        # NON-SEP VALUE-INFLUENCE PATH (mult/sum/diff/diff2/value/value_diff)
+                        # ---------------------------------------------------------------------------
+                        # delta_v here reuses ActorCriticLSTM's OWN value head -- no separate Q-network
+                        # involved. cond_probs is the real conditional policy (already computed above
+                        # during action selection); the counterfactual re-calls each agent's network
+                        # with the SAME incoming carry/obs but agent k's slot in the previous joint
+                        # action swapped to a hypothetical action, retrieving both the counterfactual
+                        # policy AND the counterfactual value from the same forward pass "for free".
                         # SOCIAL INFLUENCE REWARD -- LSTM variant. No auxiliary network at
                         # all: the MAIN policy already conditions on the previous timestep's
                         # real joint action (fed in above for action selection), so agent j's
@@ -683,6 +753,9 @@ def make_train(config):
                             return pi_j.probs, value_j
 
                         if value_influence_mode is not None:
+                            # real_value[j] is agent j's estimated value under the REAL previous
+                            # joint action -- reused from the `value` list already computed during
+                            # action selection above, no extra forward pass needed.
                             # REAL value estimate for every agent, under the REAL
                             # prev_joint_action -- already computed for free during
                             # action selection (the `value` list), same free-lunch as
@@ -708,6 +781,12 @@ def make_train(config):
                             kl_list.append(kl_per_j)
 
                             if value_influence_mode is not None:
+                                # delta_v_(k->j) = real_value[j] (under k's REAL action) minus
+                                # marginal_value[j] (the value j would have had on average, had k
+                                # acted according to k's own real policy instead of the specific
+                                # action it took). Positive means k's specific action helped j
+                                # relative to k's typical behavior; negative means it hurt, scaled
+                                # by how much.
                                 # Same marginalization, applied to the value instead of
                                 # the action distribution: "what would agent j's value
                                 # have been on average, had agent k's action been drawn
@@ -724,6 +803,14 @@ def make_train(config):
                                 marginal_value = jnp.einsum("ea,aje->je", prev_action_probs[k], cf_values)  # (j, e)
                                 delta_v_list.append(real_value - marginal_value)  # (j, e)
 
+                        # Combine the KL-based influence magnitude I (kl_stack) with delta_v according
+                        # to the active mode:
+                        #   mult:       I * delta_v          (original welfare-aware-influence formula)
+                        #   sum:        I + lambda*delta_v
+                        #   value:      delta_v alone, no I
+                        #   diff/diff2/value_diff: use the NET (reciprocal) delta_v -- see net_delta_v
+                        #   below -- delta_v_(k->j) minus delta_v_(j->k), i.e. k's effect on j net of
+                        #   j's effect back on k.
                         kl_stack = jnp.stack(kl_list, axis=0)  # (k, j, NUM_ENVS)
                         if value_influence_mode is None:
                             combined = kl_stack
@@ -835,6 +922,15 @@ def make_train(config):
                         #    resulting "influence" is always one step stale relative to the
                         #    action that produced it (see cond_probs note above).
                     elif influence_reward and value_influence_use_qnet:
+                        # ---------------------------------------------------------------------------
+                        # SEP VALUE-INFLUENCE PATH (mult_sep/sum_sep/diff_sep/diff2_sep)
+                        # ---------------------------------------------------------------------------
+                        # Same overall shape as the non-sep path above, but delta_v is computed from
+                        # the separate qnet's FROZEN target_network_params instead of the policy's own
+                        # value head -- deliberately re-derived from scratch here rather than sharing
+                        # code with the non-sep block, so nothing about those modes is touched by this
+                        # branch. The KL term I still comes from the policy (cond_probs/_cf_pi_probs_sep),
+                        # same as before; only the value term switches to the qnet.
                         # mult_sep/sum_sep/diff_sep/diff2_sep -- FOUR SEPARATE, self-
                         # contained implementations of the mult/sum/diff/diff2 formulas
                         # above. Deliberately not sharing any code with that block: the
@@ -871,6 +967,9 @@ def make_train(config):
                             )
                             return pi_j.probs
 
+                        # THIS step's real joint action (not prev_joint_action_onehot, which only
+                        # conditions the POLICY) -- the qnet estimates Q(s,a) for the CURRENT decision,
+                        # so it needs the action actually taken now, not the previous one.
                         # THIS step's real joint action (not prev_joint_action_onehot,
                         # which conditions the POLICY) -- qnet estimates Q(s,a) for the
                         # CURRENT decision, so it needs the action actually taken now.
@@ -878,6 +977,10 @@ def make_train(config):
                             jnp.stack(env_act, axis=-1), action_dim
                         )  # (NUM_ENVS, num_agents, action_dim)
 
+                        # Real Q-value for every agent under the REAL current joint action, evaluated
+                        # through the FROZEN target network. This same call also produces the qnet's
+                        # updated recurrent carry (new_qnet_hstate), threaded forward exactly like
+                        # new_policy_hstate.
                         # REAL Q-value for every agent under the REAL current joint
                         # action, via the FROZEN target network -- this is also the
                         # carry-updating call, so its returned carries become
@@ -914,6 +1017,11 @@ def make_train(config):
                             kl_per_j = _safe_kl_lstm_sep(cond_probs, marginal_probs)  # (num_agents, NUM_ENVS)
                             kl_list.append(kl_per_j)
 
+                            # Counterfactual over agent k's CURRENT action (unlike the KL term, which
+                            # counterfactualizes k's PREVIOUS action), evaluated via the qnet's frozen
+                            # target network, then marginalized by k's CURRENT real policy -- Q(s,a) is
+                            # about the current decision, so both the counterfactual and the marginalizing
+                            # weight must be anchored to "now", not to the previous timestep.
                             # delta_v term: counterfactual over agent k's CURRENT
                             # action, via qnet's FROZEN target network, marginalized by
                             # k's CURRENT real policy (Q(s,a) is about the current
@@ -941,6 +1049,9 @@ def make_train(config):
                         kl_stack = jnp.stack(kl_list, axis=0)  # (k, j, NUM_ENVS)
                         delta_v_stack = jnp.stack(delta_v_list, axis=0)  # (k, j, NUM_ENVS)
 
+                        # Same four combination formulas as the non-sep path (mult/sum/diff/diff2),
+                        # just applied to the qnet-derived delta_v_stack instead of the policy's own
+                        # value head. "value"/"value_diff" have no "_sep" counterpart.
                         if value_influence_mode == "mult_sep":
                             # r = I * delta_v
                             combined = kl_stack * delta_v_stack
@@ -1140,8 +1251,21 @@ def make_train(config):
                         )
 
                     if config["PARAMETER_SHARING"]:
+                        # ---------------------------------------------------------------------------
+                        # FEEDFORWARD (NO LSTM, NO QNET) VALUE-INFLUENCE PATH
+                        # ---------------------------------------------------------------------------
+                        # Used when the policy has no recurrent state at all (plain ActorCritic). No
+                        # network shortcut is available for "what would agent j do/have differently"
+                        # -- the counterfactual is obtained by literally re-running env.step with the
+                        # SAME rng_step and pre-step env_state_t but agent k's action swapped, then
+                        # feeding the resulting REAL counterfactual observation through the network.
+                        # More expensive (action_dim extra env.step calls per agent k per timestep)
+                        # but exact, unlike the LSTM paths' network-level approximation.
                         act_probs = pi.probs.reshape(env.num_agents, config["NUM_ENVS"], action_dim)
 
+                        # Real conditional value: cond_value is agent j's value estimate under the REAL
+                        # post-step observation (i.e. under the joint action that actually happened).
+                        # Only used when value_influence_mode is set.
                         # Real conditional: what agents actually do next, given the real
                         # joint action that was actually taken -- already have obsv for free.
                         # cond_value (the REAL next-obs value estimate per agent) is only
@@ -1155,6 +1279,11 @@ def make_train(config):
                         kl_list = []
                         delta_v_list = []  # only populated when value_influence_mode is not None
                         for k in range(env.num_agents):
+                            # Real resimulation of the environment: swap only agent k's action for each
+                            # hypothetical a_idx, keep every other agent's real action, and re-run
+                            # env.step with the SAME rng_step/env_state_t as the real step -- this
+                            # produces the actual observation that would have resulted, not an
+                            # approximation.
                             def _cf_obs(a_idx, k=k):
                                 cf_act = [
                                     jnp.where(i == k, jnp.full_like(env_act[i], a_idx), env_act[i])
@@ -1181,6 +1310,10 @@ def make_train(config):
                             kl_list.append(kl_per_j)
 
                             if value_influence_mode is not None:
+                                # delta_v_(k->j): cond_value (real value under k's real action) minus
+                                # marginal_value (expected value had k's action been drawn from k's own real
+                                # policy instead) -- reuses the same counterfactual observations/weights
+                                # already computed above for marginal_probs, just applied to the value head.
                                 # ΔV_(k->j) is how much agent j's value under k's REAL
                                 # action (cond_value, from the real resimulated next obs)
                                 # differs from what j's value would have been on average
@@ -1550,6 +1683,17 @@ def make_train(config):
                 last_val = jnp.stack(last_val, axis=0)
 
                 if value_influence_use_qnet:
+                    # ---------------------------------------------------------------------------
+                    # TERMINAL BOOTSTRAP VALUE FOR THE QNET (last_qnet_val)
+                    # ---------------------------------------------------------------------------
+                    # At the end of the rollout there is no real "next action" to hold the other
+                    # agents fixed at (unlike the mid-rollout delta_v counterfactual, which holds
+                    # every other agent at their real taken action). Instead, take the full
+                    # expectation over the joint policy: enumerate every possible joint action
+                    # (the static action_dim**num_agents grid, cheap since both are fixed Python
+                    # ints), weight each combination by the product of each agent's real policy
+                    # probability, and evaluate the qnet (via its frozen target params) at every
+                    # combination.
                     # Terminal GAE bootstrap for qnet's OWN regression target (see the
                     # extrinsic-only _calculate_gae calls below). There's no real
                     # action at this boundary (the rollout just ended), so unlike the
@@ -1569,11 +1713,15 @@ def make_train(config):
                         )
                         last_pi_probs.append(last_pi_i.probs)  # (NUM_ENVS, action_dim)
 
+                    # All possible joint actions, enumerated once per update (not per step).
                     joint_action_grid = jnp.array(
                         list(itertools.product(range(action_dim), repeat=env.num_agents))
                     )  # (action_dim**num_agents, num_agents)
                     joint_action_grid_onehot = jax.nn.one_hot(joint_action_grid, action_dim)  # (A, num_agents, action_dim)
 
+                    # Probability of each joint-action combination under the current real joint
+                    # policy: product of each agent's probability of its assigned action in that
+                    # combination.
                     # Weight of each joint-action combo under the current REAL joint
                     # policy: product of each agent's probability of its assigned
                     # action in that combo.
@@ -1593,6 +1741,8 @@ def make_train(config):
                             )
                             return qv  # (NUM_ENVS,)
 
+                        # Expected Q-value under the full joint-action distribution -- this is the
+                        # qnet's terminal bootstrap value, used by qnet_targets' GAE call above.
                         q_grid = jax.vmap(_q_at_combo)(joint_action_grid_onehot)  # (A, NUM_ENVS)
                         last_qnet_val.append(jnp.sum(combo_weights * q_grid, axis=0))  # (NUM_ENVS,)
                     last_qnet_val = jnp.stack(last_qnet_val, axis=0)  # (num_agents, NUM_ENVS)
@@ -1643,6 +1793,16 @@ def make_train(config):
                 targets = jnp.stack(targets, axis=0)
 
             if value_influence_use_qnet:
+                # ---------------------------------------------------------------------------
+                # QNET'S OWN GAE TARGET (extrinsic reward only)
+                # ---------------------------------------------------------------------------
+                # The qnet must never regress toward a return that already has delta_v folded
+                # into it (that would be circular -- the reward-generating critic training on
+                # a target that already contains its own signal). So this reuses the same
+                # generic _calculate_gae closure but substitutes traj_batch[i].info["qnet_value"]
+                # for `value` and traj_batch[i].info["extrinsic_reward"] (raw, unshaped env
+                # reward) for `reward`, bootstrapped from last_qnet_val (computed below). This
+                # never touches the policy's own `targets` or ActorCriticLSTM's value head.
                 # Independent, extrinsic-only GAE target for qnet's own regression --
                 # reuses the same _calculate_gae closure (it's generic over
                 # .done/.value/.reward) but with EXTRINSIC reward and qnet's OWN value
@@ -2236,22 +2396,19 @@ def make_train(config):
                     metric[f"agent{i}/P_own_coin_ratio"] = own_i / (own_i + other_i + 1e-8)
 
                 metric.update(_welfare_metrics(reward_means))
-                # reward_means is post-shaping: env reward, PLUS the influence-reward
-                # bonus actually added to `reward` (per_agent_info["influence_reward"]
-                # is that measured delta itself -- see influence_contribution above,
-                # already accounts for beta, any annealing, and any done-step masking),
-                # MINUS value_inequity_penalty (subtracted from `reward`, so it needs to
-                # be added back here). Both fall back to zero when their mechanism is
-                # disabled/absent, recovering pure env reward either way.
-                influence_means = per_agent_info.get(
-                    "influence_reward", jnp.zeros(num_agents)
-                )
+                # original_rewards is coin_game.py's own pre-ANY-shaping snapshot --
+                # set in every branch (plain/shared/svo/interest/inequity_aversion), so
+                # reading it directly is simpler AND more robust than reconstructing it
+                # by adding back individual training-loop-level shaping components
+                # (influence_reward/value_inequity_penalty): it also correctly excludes
+                # ENV_KWARGS.inequity_aversion's penalty, which reward_means alone
+                # cannot recover (that shaping happens inside the env, before `reward`
+                # is ever returned -- there's no separate delta to add back here).
                 value_inequity_penalty_means = per_agent_info.get(
                     "value_inequity_penalty", jnp.zeros(num_agents)
                 )
-                metric["Overall/env_reward"] = jnp.sum(
-                    reward_means - influence_means + value_inequity_penalty_means
-                )
+                original_reward_means = per_agent_info["original_rewards"]
+                metric["Overall/env_reward"] = jnp.sum(original_reward_means)
                 # Just the intrinsic/inequity-aversion component on its own (not netted
                 # against env reward like Overall/env_reward above) -- zero whenever
                 # VALUE_INEQUITY_AVERSION is disabled.
@@ -2289,20 +2446,17 @@ def make_train(config):
                     metric[i]["P_own_coin_ratio"] = own_i / (own_i + other_i + 1e-8)
 
                 reward_means = jnp.stack([metric[i]["reward"] for i in range(num_agents)])
-                # Same env-vs-intrinsic split as the PARAMETER_SHARING branch above:
-                # metric[i]["reward"] is post-shaping, metric[i]["influence_reward"]
-                # (present only when influence reward is enabled) is the measured
-                # influence-reward bonus actually added to reward, and
-                # metric[i]["value_inequity_penalty"] (present only when
-                # VALUE_INEQUITY_AVERSION is enabled) was SUBTRACTED from reward, so it
-                # needs to be added back -- the two intrinsic/shaping components.
-                influence_means = jnp.stack([
-                    metric[i].get("influence_reward", jnp.array(0.0))
-                    for i in range(num_agents)
-                ])
                 value_inequity_penalty_means = jnp.stack([
                     metric[i].get("value_inequity_penalty", jnp.array(0.0))
                     for i in range(num_agents)
+                ])
+                # original_rewards is coin_game.py's own pre-ANY-shaping snapshot --
+                # see the matching comment in the PARAMETER_SHARING branch above for why
+                # reading it directly (rather than reconstructing from reward_means +
+                # influence/value_inequity components) is the robust choice, including
+                # for ENV_KWARGS.inequity_aversion runs.
+                original_reward_means = jnp.stack([
+                    metric[i]["original_rewards"] for i in range(num_agents)
                 ])
 
                 merged = {}
@@ -2313,13 +2467,23 @@ def make_train(config):
                 metric["update_step"] = update_step
                 metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
                 metric.update(_welfare_metrics(reward_means))
-                metric["Overall/env_reward"] = jnp.sum(
-                    reward_means - influence_means + value_inequity_penalty_means
-                )
+                metric["Overall/env_reward"] = jnp.sum(original_reward_means)
                 metric["Overall/value_inequity_penalty"] = jnp.sum(value_inequity_penalty_means)
                 metric["Overall/S_sustainability"] = sustainability
 
             if value_influence_use_qnet:
+                # ---------------------------------------------------------------------------
+                # QNET REPLAY BUFFER WRITE + PERIODIC LEARN PHASE + TARGET-NETWORK SYNC
+                # ---------------------------------------------------------------------------
+                # Runs once per update (not once per env step). Three things happen here:
+                #   1. Package this update's (obs, joint_action, qnet_targets, done) into a
+                #      QTimestep and add it to the trajectory buffer.
+                #   2. If the buffer has enough data (can_sample), sample a batch of sequences
+                #      and run one gradient step on the qnet's ONLINE params (_qnet_learn);
+                #      otherwise skip (_qnet_skip).
+                #   3. Every VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL updates, sync
+                #      target_network_params from params (the only way target_network_params
+                #      ever changes -- it never receives a gradient directly).
                 # Fill the qnet replay buffer with this update's (obs, joint_action,
                 # extrinsic-only target) sequences, then -- gated by can_sample, same
                 # "cheap write every step, expensive work only when ready" pattern as
@@ -2333,6 +2497,8 @@ def make_train(config):
                 qnet_target_batch = jnp.transpose(qnet_targets, (1, 2, 0))  # (NUM_STEPS, NUM_ENVS, num_agents)
                 qnet_done_batch = traj_batch[0].done  # (NUM_STEPS, NUM_ENVS), synchronized across agents
 
+                # swapaxes(0, 1) moves NUM_ENVS to the first axis, matching the buffer's
+                # add_batch_size convention (set to NUM_ENVS at buffer construction).
                 q_timestep = QTimestep(
                     obs=jnp.swapaxes(qnet_obs, 0, 1),                      # (NUM_ENVS, NUM_STEPS, num_agents, *obs_shape)
                     joint_action_onehot=jnp.swapaxes(qnet_joint_action_onehot, 0, 1),
@@ -2341,6 +2507,14 @@ def make_train(config):
                 )
                 qnet_buffer_state = qnet_buffer.add(qnet_buffer_state, q_timestep)
 
+                # Sample a batch of contiguous sequences from the buffer and run one gradient
+                # step per agent's qnet on its ONLINE params. The recurrent carry starts at
+                # zero for each sampled sequence (since a sequence may start mid-episode) and
+                # is unrolled in order via jax.lax.scan, resetting at episode boundaries
+                # (reset_in). The first qnet_burn_in steps of each sequence are excluded from
+                # the loss (R2D2-style burn-in): the carry hasn't had time to reach a
+                # plausible mid-sequence state yet, so predictions there are unreliable and
+                # would poison the gradient if included.
                 qnet_burn_in = config.get("VALUE_INFLUENCE_BURN_IN", 4)
 
                 def _qnet_learn(carry):
@@ -2400,16 +2574,27 @@ def make_train(config):
 
                     return (new_qnet_train_state, rng), (jnp.stack(losses), jnp.stack(qpreds))
 
+                # No-op used when the buffer doesn't yet have enough data to sample from --
+                # returns the qnet_train_state unchanged and zero-valued diagnostic metrics.
                 def _qnet_skip(carry):
                     qnet_train_state, rng = carry
                     return (qnet_train_state, rng), (jnp.zeros(env.num_agents), jnp.zeros(env.num_agents))
 
+                # jax.lax.cond is required (not a Python if) since is_learn_time is a
+                # dynamically-traced value under jit/scan.
                 is_learn_time = qnet_buffer.can_sample(qnet_buffer_state)
                 rng, _qnet_rng = jax.random.split(rng)
                 (qnet_train_state, _qnet_rng), (qnet_losses, qnet_qpreds) = jax.lax.cond(
                     is_learn_time, _qnet_learn, _qnet_skip, (qnet_train_state, _qnet_rng)
                 )
 
+                # Periodic (every target_update_interval updates) sync of target_network_params
+                # from params via optax.incremental_update -- tau=1.0 (default) is a full
+                # hard copy; tau<1.0 would be a soft/interpolated (Polyak) update. This is the
+                # ONLY way target_network_params ever changes; it never receives a direct
+                # gradient. Keeping it frozen between syncs is what makes the reward signal
+                # read by _env_step (Sections 5-6 above) stable across many updates, instead
+                # of tracking a target that moves every gradient step.
                 # Periodic hard/soft target sync -- the reward-facing copy
                 # (target_network_params, read in _env_step) only changes every
                 # VALUE_INFLUENCE_TARGET_UPDATE_INTERVAL updates, regardless of how
@@ -2428,6 +2613,10 @@ def make_train(config):
                     for ts in qnet_train_state
                 ]
 
+                # Diagnostic logging: qnet's own regression loss and mean predicted value per
+                # agent, to check the qnet is actually learning to predict extrinsic return
+                # correctly (independent from whether the resulting delta_v reward improves
+                # policy behavior).
                 for i in range(num_agents):
                     metric[f"agent{i}/qnet_loss"] = qnet_losses[i]
                     metric[f"agent{i}/qnet_pred_mean"] = qnet_qpreds[i]
